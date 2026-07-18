@@ -40,6 +40,12 @@ DATA = os.path.join(ROOT, "data")
 
 OPEN_GROSS = 0.30 / 100          # порог открытия события (валовый спред)
 CLOSE_GROSS = 0.10 / 100         # порог закрытия (гистерезис)
+MAX_QUOTE_AGE_MS = 10_000        # встречная нога свежее N мс, иначе пара не считается
+                                 # (bookTicker пушится на каждое изменение: в активном
+                                 # рынке котировки текут постоянно; старше 10с = мёртвый
+                                 # фид или замёрзший стакан — не сигнал, а фантом)
+SANITY_GROSS = 15.0 / 100        # спред больше 15% = разные активы под одним тикером
+                                 # (мемкоин-коллизии: AI, ANTHROPIC...) -> карантин пары
 MIN_EVENT_MS = 0                 # события короче — тоже пишем (фильтруем потом)
 SNAP_EVERY = 1.0                 # сек между снапшотами
 FLUSH_EVERY = 60.0               # сек между сбросами parquet-буферов
@@ -82,6 +88,7 @@ class Engine:
         self.books: dict[str, dict[str, Quote]] = {}       # sym -> exch -> Quote
         self.fees = fees
         self.events: dict[tuple, Event] = {}               # (sym,buy,sell) -> Event
+        self.banned: set[tuple] = set()                    # (sym, exA, exB) карантин
         self.snap_buf: list = []
         self.tick_buf: list = []                           # full-res внутри событий
         self.fund_buf: list = []
@@ -103,13 +110,25 @@ class Engine:
         for other, oq in book.items():
             if other == exch or oq.ask <= 0 or oq.bid <= 0 or ask <= 0 or bid <= 0:
                 continue
+            if loc - oq.loc_ts > MAX_QUOTE_AGE_MS:
+                continue
             # направление 1: купить на exch (ask), продать на other (bid)
             self._check(sym, exch, other, q, oq, loc)
             # направление 2: купить на other, продать на exch
             self._check(sym, other, exch, oq, q, loc)
 
     def _check(self, sym, buy_ex, sell_ex, bq_, sq_, loc):
+        pkey = (sym,) + tuple(sorted((buy_ex, sell_ex)))
+        if pkey in self.banned:
+            return
         gross = sq_.bid / bq_.ask - 1.0
+        if gross > SANITY_GROSS:                           # разные активы под тикером
+            self.banned.add(pkey)
+            self.events.pop((sym, buy_ex, sell_ex), None)
+            self.events.pop((sym, sell_ex, buy_ex), None)
+            self.log(f"КАРАНТИН {sym} {buy_ex}<->{sell_ex}: спред {gross*100:+.0f}% — "
+                     f"похоже, разные активы под одним тикером")
+            return
         key = (sym, buy_ex, sell_ex)
         ev = self.events.get(key)
         if ev is None:
@@ -134,14 +153,14 @@ class Engine:
         self.tick_buf.append((loc, ev.sym, ev.buy_ex, ev.sell_ex,
                               bq_.ask, bq_.aq, sq_.bid, sq_.bq, gross))
 
-    def _close(self, key, ev: Event, loc):
+    def _close(self, key, ev: Event, loc, forced: bool = False):
         del self.events[key]
         dur = loc - ev.t_open
         if dur < MIN_EVENT_MS:
             return
         fee = 2 * (self.fees.get(ev.buy_ex, 5e-4) + self.fees.get(ev.sell_ex, 5e-4))
         net = ev.max_gross - fee
-        rec = dict(sym=ev.sym, buy_ex=ev.buy_ex, sell_ex=ev.sell_ex,
+        rec = dict(sym=ev.sym, buy_ex=ev.buy_ex, sell_ex=ev.sell_ex, forced=int(forced),
                    t_open=ev.t_open, t_close=loc, dur_ms=dur,
                    max_gross_pct=ev.max_gross * 100, net_after_4taker_pct=net * 100,
                    mean_gross_pct=ev.sum_gross / max(ev.n_ticks, 1) * 100,
@@ -151,7 +170,7 @@ class Engine:
                    usd_at_top=min(ev.bq_at_max * ev.bid_at_max,
                                   ev.aq_at_max * ev.ask_at_max))
         self.done_events.append(rec)
-        if self.verbose:
+        if self.verbose and not forced:
             self.log(f"СОБЫТИЕ {ev.sym} buy@{ev.buy_ex}/sell@{ev.sell_ex}: "
                      f"max {ev.max_gross*100:+.2f}% (net {net*100:+.2f}%), "
                      f"{dur/1000:.1f}с, ~${rec['usd_at_top']:,.0f} у вершины")
@@ -171,11 +190,15 @@ class Store:
         os.makedirs(DATA, exist_ok=True)
         self.db = sqlite3.connect(os.path.join(DATA, "opportunities.db"))
         self.db.execute("""CREATE TABLE IF NOT EXISTS events(
-            sym TEXT, buy_ex TEXT, sell_ex TEXT, t_open INT, t_close INT,
+            sym TEXT, buy_ex TEXT, sell_ex TEXT, forced INT, t_open INT, t_close INT,
             dur_ms INT, max_gross_pct REAL, net_after_4taker_pct REAL,
             mean_gross_pct REAL, n_ticks INT, sell_bid_at_max REAL,
             buy_ask_at_max REAL, sell_bidqty_at_max REAL, buy_askqty_at_max REAL,
             usd_at_top REAL)""")
+        try:
+            self.db.execute("ALTER TABLE events ADD COLUMN forced INT DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass                                           # колонка уже есть
         self.db.execute("CREATE INDEX IF NOT EXISTS ix_ev_t ON events(t_open)")
         self.db.commit()
 
@@ -216,7 +239,9 @@ async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--minutes", type=float, default=0, help="0 = бесконечно")
     ap.add_argument("--max-symbols", type=int, default=0, help="кап общих символов (0=все)")
-    ap.add_argument("--exchanges", type=str, default="binance,bybit,gate,okx,mexc,bitget")
+    # mexc исключён из дефолта: его тикер-канал ~1 сообщение/сек/символ с лагом
+    # 1-2.5с — медленная нога рождает фантомные спреды; вернём после sub.depth
+    ap.add_argument("--exchanges", type=str, default="binance,bybit,gate,okx,bitget")
     args = ap.parse_args()
     want = [x.strip() for x in args.exchanges.split(",") if x.strip() in CONNECTORS]
 
@@ -302,9 +327,9 @@ async def main():
         finally:
             for t in tasks:
                 t.cancel()
-            # закрыть висящие события и дописать буферы
+            # закрыть висящие события (с пометкой forced) и дописать буферы
             for key, ev in list(eng.events.items()):
-                eng._close(key, ev, now_ms())
+                eng._close(key, ev, now_ms(), forced=True)
             store.flush(eng)
             n = store.db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
             eng.log(f"стоп. событий в журнале: {n}. данные: {DATA}")
