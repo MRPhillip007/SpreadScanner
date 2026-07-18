@@ -320,6 +320,9 @@ class Forward:
             bq, sq = book.get(tr.buy_ex), book.get(tr.sell_ex)
             if not bq or not sq or bq.bid <= 0 or sq.bid <= 0:
                 continue
+            if o.leg != "entry_maker":                   # пассивные ВЫХОДНЫЕ лимитки
+                self._exit_maker_tick(o, tr, lst, book, loc)
+                continue
             # 1) налив: цена прошла СКВОЗЬ наш уровень (строгое правило очереди)
             if bq.ask < o.limit_px * (1 - 1e-12):
                 lst.remove(o)
@@ -350,6 +353,39 @@ class Forward:
             # 3) репрайс: следуем за лучшим бидом (paper: очередь теряем, это ок)
             if abs(bq.bid / o.limit_px - 1) > 2e-4:
                 o.limit_px = bq.bid
+
+    def _exit_maker_tick(self, o: POrder, tr: Trade, lst, book, loc):
+        """Пассивная закрывающая лимитка: налив по строгому проходу, репрайс за
+        своей стороной, эскалация в тейкер по passive_ttl."""
+        q = book.get(o.venue)
+        if not q or q.bid <= 0:
+            return
+        through = (q.bid > o.limit_px * (1 + 1e-12)) if o.side == "sell" \
+            else (q.ask < o.limit_px * (1 - 1e-12))
+        if through:
+            lst.remove(o)
+            o.status, o.fill_px, o.fill_qty = "filled", o.limit_px, o.qty
+            o.fee_usd = o.qty * o.limit_px * self.maker_fees.get(o.venue, 2e-4)
+            tr.fees += o.fee_usd
+            self.cash[o.venue] = self.cash.get(o.venue, 0.0) - o.fee_usd
+            self._order_row(o, loc)
+            if all(x.status != "pending" for x in tr.exit_orders):
+                self._finish_exit(tr, loc)
+            return
+        if loc - o.created > self.cfg["exit"]["passive_ttl_min"] * 60_000:
+            lst.remove(o)                                # эскалация в тейкер
+            o.status = "cancelled"
+            self._order_row(o, loc)
+            dpx = q.bid if o.side == "sell" else q.ask
+            t = self._submit(tr.trade_id, o.leg, o.venue, o.sym, o.side, "taker",
+                             None, o.qty, dpx, loc)
+            tr.exit_orders = [t if x is o else x for x in tr.exit_orders]
+            self.eng.log(f"ЭСКАЛАЦИЯ #{tr.trade_id} {o.sym} {o.leg}: "
+                         f"пассивный выход не налился {self.cfg['exit']['passive_ttl_min']}м — тейкер")
+            return
+        target = q.ask if o.side == "sell" else q.bid    # держимся у своей стороны
+        if abs(target / o.limit_px - 1) > 2e-4:
+            o.limit_px = target
 
     def _cancel_maker(self, tr: Trade, loc, reason):
         self.store.q("UPDATE trades SET t_close=?, status='closed', exit_reason=?, "
@@ -430,9 +466,14 @@ class Forward:
             for tr in list(self.trades.values()):
                 if tr.status == "open":
                     if loc - tr.t_open > self.cfg["exit"]["timeout_min"] * 60_000:
-                        self._start_exit(tr, loc, "timeout")
+                        self._start_exit(tr, loc, "timeout", style="maker")
                     else:
                         self._accrue_funding(tr, loc)
+                        # carry против съел долю ожидаемого захвата -> пассивный выход
+                        budget = tr.theor_net * tr.notional
+                        if (tr.funding < 0 and budget > 0
+                                and -tr.funding > self.cfg["exit"]["funding_eat_frac"] * budget):
+                            self._start_exit(tr, loc, "funding_bleed", style="maker")
             for sym in list(self.makers):                       # TTL в тихих стаканах
                 self._maker_tick(sym, loc)
             due = [m for m in self.mk_watch if m[0] <= loc]     # маркауты
@@ -502,15 +543,26 @@ class Forward:
                 continue
             gross_now = sq.bid / bq.ask - 1.0
             if gross_now * 100 <= c["converge_gross_pct"]:
-                self._start_exit(tr, loc, "converged")
+                self._start_exit(tr, loc, "converged", style="taker")
             elif (gross_now - tr.theor_gross) * 100 >= c["stop_widen_pct"]:
-                self._start_exit(tr, loc, "stop_widen")
+                self._start_exit(tr, loc, "stop_widen", style="taker")
 
-    def _start_exit(self, tr: Trade, loc, reason):
+    def _start_exit(self, tr: Trade, loc, reason, style: str = "taker"):
         tr.status = "exiting"
         tr.exit_reason = reason
         book = self.eng.books.get(tr.sym, {})
         bq, sq = book.get(tr.buy_ex), book.get(tr.sell_ex)
+        if style == "maker" and bq and sq and bq.ask > 0 and sq.bid > 0:
+            # пассивный выход: продаём лонг лимиткой в аск своей биржи,
+            # откупаем шорт лимиткой в бид своей — экономим внутренние спреды
+            o1 = self._mk_order(tr.trade_id, "exit_buy", tr.buy_ex, tr.sym, "sell",
+                                bq.ask, tr.qty, loc)
+            o2 = self._mk_order(tr.trade_id, "exit_sell", tr.sell_ex, tr.sym, "buy",
+                                sq.bid, tr.qty, loc)
+            tr.exit_orders = [o1, o2]
+            self.eng.log(f"ВЫХОД[maker] #{tr.trade_id} {tr.sym} [{reason}]: "
+                         f"sell@{tr.buy_ex} {bq.ask:.6g} / buy@{tr.sell_ex} {sq.bid:.6g}")
+            return
         dpx_b = bq.bid if bq else tr.buy_fill
         dpx_s = sq.ask if sq else tr.sell_fill
         tr.exit_orders = [
@@ -519,6 +571,14 @@ class Forward:
             self._submit(tr.trade_id, "exit_sell", tr.sell_ex, tr.sym, "buy", "taker",
                          None, tr.qty, dpx_s, loc),
         ]
+
+    def _mk_order(self, tid, leg, venue, sym, side, px, qty, loc) -> POrder:
+        self.n_orders += 1
+        ow = self.rtt.get(venue, self.cfg["latency"]["default_one_way_ms"])
+        o = POrder(self.n_orders, tid, leg, venue, sym, side, "maker", px, qty, px,
+                   loc, int(loc + ow))
+        self.makers.setdefault(sym, []).append(o)
+        return o
 
     def _finish_exit(self, tr: Trade, loc):
         pnl = 0.0
