@@ -46,6 +46,10 @@ MAX_QUOTE_AGE_MS = 10_000        # встречная нога свежее N м
                                  # фид или замёрзший стакан — не сигнал, а фантом)
 SANITY_GROSS = 15.0 / 100        # спред больше 15% = разные активы под одним тикером
                                  # (мемкоин-коллизии: AI, ANTHROPIC...) -> карантин пары
+FEED_HEALTH_MS = 3_000           # коннектор жив = ЛЮБОЕ сообщение за последние 3с
+                                 # (на активном соединении сотни символов -> тишина 3с
+                                 # значит болен сам фид, а не «стакан не менялся»)
+IDENT_TOL = 0.05                 # стартовая сверка активов: цена ноги vs медиана бирж
 MIN_EVENT_MS = 0                 # события короче — тоже пишем (фильтруем потом)
 SNAP_EVERY = 1.0                 # сек между снапшотами
 FLUSH_EVERY = 60.0               # сек между сбросами parquet-буферов
@@ -89,6 +93,7 @@ class Engine:
         self.fees = fees
         self.events: dict[tuple, Event] = {}               # (sym,buy,sell) -> Event
         self.banned: set[tuple] = set()                    # (sym, exA, exB) карантин
+        self.conn_last: dict[str, int] = {}                # exch -> ms последнего сообщения
         self.snap_buf: list = []
         self.tick_buf: list = []                           # full-res внутри событий
         self.fund_buf: list = []
@@ -102,6 +107,7 @@ class Engine:
     # ── горячий путь ──
     def on_quote(self, exch, sym, bid, bq, ask, aq, exch_ts):
         loc = now_ms()
+        self.conn_last[exch] = loc
         q = self.books.setdefault(sym, {}).setdefault(exch, Quote())
         q.bid, q.bq, q.ask, q.aq, q.exch_ts, q.loc_ts = bid, bq, ask, aq, exch_ts, loc
         book = self.books[sym]
@@ -110,8 +116,10 @@ class Engine:
         for other, oq in book.items():
             if other == exch or oq.ask <= 0 or oq.bid <= 0 or ask <= 0 or bid <= 0:
                 continue
+            if loc - self.conn_last.get(other, 0) > FEED_HEALTH_MS:
+                continue                                   # фид встречной биржи болен
             if loc - oq.loc_ts > MAX_QUOTE_AGE_MS:
-                continue
+                continue                                   # конкретная подписка молчит
             # направление 1: купить на exch (ask), продать на other (bid)
             self._check(sym, exch, other, q, oq, loc)
             # направление 2: купить на other, продать на exch
@@ -273,6 +281,33 @@ async def main():
         fees = {ex: CONNECTORS[ex].taker for ex in want}
         eng = Engine(fees)
         store = Store()
+
+        # ── сверка идентичности активов (метаданные + цены, а не строка тикера) ──
+        merged = sum(1 for ex in want for s in common_l
+                     if s in sym_maps[ex] and sym_maps[ex][s].get("scale", 1) > 1)
+        print(f"кратных контрактов склеено масштабом: {merged}", flush=True)
+        price_maps = {}
+        for ex in want:
+            try:
+                price_maps[ex] = await CONNECTORS[ex].fetch_prices(session)
+            except Exception as e:
+                print(f"{ex}: цены для сверки недоступны ({type(e).__name__})", flush=True)
+                price_maps[ex] = {}
+        nban = 0
+        for s in common_l:
+            ps = {ex: price_maps[ex][s] for ex in want if s in price_maps.get(ex, {})}
+            if len(ps) < 2:
+                continue
+            med = float(np.median(list(ps.values())))
+            for ex, p in ps.items():
+                if med > 0 and abs(p / med - 1) > IDENT_TOL:
+                    for other in want:
+                        if other != ex:
+                            eng.banned.add((s,) + tuple(sorted((ex, other))))
+                    nban += 1
+                    print(f"  идентичность: {s}@{ex} last={p:.6g} vs медиана {med:.6g} "
+                          f"({(p/med-1)*100:+.1f}%) — нога в карантине", flush=True)
+        print(f"сверка активов: в карантине ног {nban}", flush=True)
         conns = []
         for ex in want:
             syms = [s for s in common_l if s in sym_maps[ex]]
