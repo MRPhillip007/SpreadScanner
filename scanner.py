@@ -94,6 +94,10 @@ class Engine:
         self.events: dict[tuple, Event] = {}               # (sym,buy,sell) -> Event
         self.banned: set[tuple] = set()                    # (sym, exA, exB) карантин
         self.conn_last: dict[str, int] = {}                # exch -> ms последнего сообщения
+        # хуки форвард-слоя (не должны кидать исключения в горячий путь)
+        self.on_event_open = None                          # (Event, buy_q, sell_q, loc)
+        self.on_event_tick = None                          # (Event, buy_q, sell_q, loc)
+        self.on_quote_hook = None                          # (exch, sym, Quote, loc)
         self.snap_buf: list = []
         self.tick_buf: list = []                           # full-res внутри событий
         self.fund_buf: list = []
@@ -124,6 +128,8 @@ class Engine:
             self._check(sym, exch, other, q, oq, loc)
             # направление 2: купить на other, продать на exch
             self._check(sym, other, exch, oq, q, loc)
+        if self.on_quote_hook is not None:
+            self.on_quote_hook(exch, sym, q, loc)
 
     def _check(self, sym, buy_ex, sell_ex, bq_, sq_, loc):
         pkey = (sym,) + tuple(sorted((buy_ex, sell_ex)))
@@ -144,6 +150,8 @@ class Engine:
                 ev = Event(sym, buy_ex, sell_ex, loc)
                 self.events[key] = ev
                 self._upd(ev, gross, bq_, sq_, loc)
+                if self.on_event_open is not None:
+                    self.on_event_open(ev, bq_, sq_, loc)
         else:
             if gross < CLOSE_GROSS:
                 self._close(key, ev, loc)
@@ -160,6 +168,8 @@ class Engine:
             ev.bq_at_max, ev.aq_at_max = sq_.bq, bq_.aq
         self.tick_buf.append((loc, ev.sym, ev.buy_ex, ev.sell_ex,
                               bq_.ask, bq_.aq, sq_.bid, sq_.bq, gross))
+        if self.on_event_tick is not None:
+            self.on_event_tick(ev, bq_, sq_, loc)
 
     def _close(self, key, ev: Event, loc, forced: bool = False):
         del self.events[key]
