@@ -209,7 +209,11 @@ class Forward:
         c = self.cfg
         gross = sq.bid / bq.ask - 1.0
         fee = 2 * (self.fees[ev.buy_ex] + self.fees[ev.sell_ex])
-        net = gross - fee
+        # полный ожидаемый захват: минус остаток на выходе и ВНУТРЕННИЕ спреды
+        # обеих бирж (тейкер-выход продаёт в бид и откупает по аску своей биржи)
+        exit_cost = ((bq.ask - bq.bid) / bq.ask + (sq.ask - sq.bid) / sq.bid
+                     + c["exit"]["converge_gross_pct"] / 100)
+        net = gross - fee - exit_cost
         cap = min(bq.aq * bq.ask, sq.bq * sq.bid) * c["paper"]["top_book_frac"]
         if any(t.sym == ev.sym and t.status != "closed" for t in self.trades.values()):
             return                                              # уже в связке по символу
@@ -271,7 +275,9 @@ class Forward:
         P = bq.bid                                       # встаём в лучший бид (мейкер)
         fee_cycle = (self.maker_fees.get(ev.buy_ex, 2e-4) + self.fees[ev.sell_ex]
                      + self.fees[ev.buy_ex] + self.fees[ev.sell_ex])
-        exp_net = sq.bid / P - 1.0 - fee_cycle
+        exit_cost = ((bq.ask - bq.bid) / bq.ask + (sq.ask - sq.bid) / sq.bid
+                     + self.cfg["exit"]["converge_gross_pct"] / 100)
+        exp_net = sq.bid / P - 1.0 - fee_cycle - exit_cost
         if exp_net * 100 < c["net_min_pct"]:
             self._decide(loc, *key, gross, exp_net, cap, "deny:maker_net")
             return
