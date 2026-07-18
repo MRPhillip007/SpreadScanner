@@ -45,7 +45,7 @@ def summary():
 
 @app.get("/api/trades")
 def trades(limit: int = 100):
-    return q("""SELECT trade_id, sym, buy_ex, sell_ex, t_open, t_close, qty,
+    return q("""SELECT trade_id, scheme, sym, buy_ex, sell_ex, t_open, t_close, qty,
                 notional_usd, theor_net_pct, pnl_usd, entry_slip_usd, exit_slip_usd,
                 fees_usd, funding_usd, exit_reason, hold_ms
                 FROM trades WHERE status='closed' ORDER BY t_close DESC LIMIT ?""", (limit,))
@@ -101,8 +101,8 @@ async function tick(){
   s.exit_reasons.map(r=>`<tr><td>${r.exit_reason}</td><td>${r.n}</td><td>${pn(r.pnl)}</td></tr>`).join('');
  const tr=await f('/api/trades?limit=40');
  document.getElementById('trades').innerHTML=
-  '<tr><th>#</th><th>время</th><th>символ</th><th>пара</th><th>$</th><th>теор.net%</th><th>PnL $</th><th>слип $</th><th>комис</th><th>холд с</th><th>выход</th></tr>'+
-  tr.map(t=>`<tr><td>${t.trade_id}</td><td>${ts(t.t_close)}</td><td>${t.sym}</td>
+  '<tr><th>#</th><th>схема</th><th>время</th><th>символ</th><th>пара</th><th>$</th><th>теор.net%</th><th>PnL $</th><th>слип $</th><th>комис</th><th>холд с</th><th>выход</th></tr>'+
+  tr.map(t=>`<tr><td>${t.trade_id}</td><td>${t.scheme}</td><td>${ts(t.t_close)}</td><td>${t.sym}</td>
    <td>${t.buy_ex}→${t.sell_ex}</td><td>${t.notional_usd.toFixed(0)}</td>
    <td>${t.theor_net_pct.toFixed(2)}</td><td>${pn(t.pnl_usd)}</td>
    <td>${pn(-(t.entry_slip_usd+t.exit_slip_usd))}</td><td>${t.fees_usd.toFixed(2)}</td>

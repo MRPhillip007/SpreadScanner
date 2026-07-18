@@ -97,6 +97,7 @@ class Engine:
         # хуки форвард-слоя (не должны кидать исключения в горячий путь)
         self.on_event_open = None                          # (Event, buy_q, sell_q, loc)
         self.on_event_tick = None                          # (Event, buy_q, sell_q, loc)
+        self.on_event_close = None                         # (Event, loc, forced)
         self.on_quote_hook = None                          # (exch, sym, Quote, loc)
         self.snap_buf: list = []
         self.tick_buf: list = []                           # full-res внутри событий
@@ -188,6 +189,8 @@ class Engine:
                    usd_at_top=min(ev.bq_at_max * ev.bid_at_max,
                                   ev.aq_at_max * ev.ask_at_max))
         self.done_events.append(rec)
+        if self.on_event_close is not None:
+            self.on_event_close(ev, loc, forced)
         if self.verbose and not forced:
             self.log(f"СОБЫТИЕ {ev.sym} buy@{ev.buy_ex}/sell@{ev.sell_ex}: "
                      f"max {ev.max_gross*100:+.2f}% (net {net*100:+.2f}%), "

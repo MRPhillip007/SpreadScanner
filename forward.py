@@ -72,14 +72,20 @@ class FStore:
             status TEXT, qty REAL, notional_usd REAL, theor_gross_pct REAL,
             theor_net_pct REAL, entry_slip_usd REAL DEFAULT 0, exit_slip_usd REAL DEFAULT 0,
             trim_usd REAL DEFAULT 0, fees_usd REAL DEFAULT 0, funding_usd REAL DEFAULT 0,
-            pnl_usd REAL, exit_reason TEXT, hold_ms INT);
+            pnl_usd REAL, exit_reason TEXT, hold_ms INT, scheme TEXT DEFAULT 'taker');
         CREATE TABLE IF NOT EXISTS incidents(ts INT, kind TEXT, trade_id INT, detail TEXT);
+        CREATE TABLE IF NOT EXISTS markouts(ts INT, trade_id INT, sym TEXT, venue TEXT,
+            fill_px REAL, ref0 REAL, ref_after REAL, markout_bps REAL);
         CREATE TABLE IF NOT EXISTS venue_rtt(ts INT, venue TEXT, rtt_ms REAL);
         CREATE TABLE IF NOT EXISTS equity(ts INT, venue TEXT, cash REAL);
         CREATE TABLE IF NOT EXISTS feeds(ts INT, venue TEXT, rate REAL, lag_ms REAL);
         CREATE INDEX IF NOT EXISTS ix_dec_ts ON decisions(ts);
         CREATE INDEX IF NOT EXISTS ix_tr_ts ON trades(t_open);
         """)
+        try:
+            self.db.execute("ALTER TABLE trades ADD COLUMN scheme TEXT DEFAULT 'taker'")
+        except sqlite3.OperationalError:
+            pass
         self.db.commit()
 
     def q(self, sql, args=()):
@@ -132,6 +138,7 @@ class Trade:
     funding: float = 0.0
     last_fund_mark: int = 0
     exit_reason: str = ""
+    scheme: str = "taker"
 
 
 class Forward:
@@ -146,14 +153,38 @@ class Forward:
         self.rtt: dict[str, float] = {}
         self.funding: dict[str, dict[str, float]] = {}          # venue -> canon -> rate
         self.pending: dict[tuple, list[POrder]] = {}            # (venue,sym) -> orders
+        self.makers: dict[str, list[POrder]] = {}               # sym -> пассивные заявки
         self.trades: dict[int, Trade] = {}                      # открытые/входящие
         self.cooldown: dict[tuple, int] = {}                    # (sym,exA,exB) -> until ms
         self.last_eval: dict[tuple, int] = {}
         self.day_pnl: dict[int, float] = {}
+        self.pair_hist: dict[tuple, list] = {}                  # профиль связки: t_close событий
+        self.mk_watch: list = []                                # маркауты: (due, tid, sym, ...)
+        self.maker_fees = {}
         self.n_orders = 0
         eng.on_event_open = self._on_event
         eng.on_event_tick = self._on_event
+        eng.on_event_close = self._on_event_close
         eng.on_quote_hook = self._on_quote
+
+    # ---------- профиль связки и выбор схемы ----------
+    def _on_event_close(self, ev, loc, forced):
+        if forced:
+            return
+        pk = (ev.sym,) + tuple(sorted((ev.buy_ex, ev.sell_ex)))
+        h = self.pair_hist.setdefault(pk, [])
+        h.append(loc)
+        w = self.cfg["scheme"]["osc_window_min"] * 60_000
+        self.pair_hist[pk] = [t for t in h if t > loc - w]
+
+    def _pick_scheme(self, sym, exA, exB, loc) -> str:
+        mode = self.cfg["scheme"]["mode"]
+        if mode in ("taker", "maker"):
+            return mode
+        pk = (sym,) + tuple(sorted((exA, exB)))
+        w = self.cfg["scheme"]["osc_window_min"] * 60_000
+        n = sum(1 for t in self.pair_hist.get(pk, []) if t > loc - w)
+        return "maker" if n >= self.cfg["scheme"]["osc_min_events"] else "taker"
 
     # ---------- журнал решений ----------
     def _decide(self, ts, sym, b, s, gross, net, cap, action, trade_id=None):
@@ -206,27 +237,128 @@ class Forward:
             if used + notional > c["risk"]["per_venue_exposure_usd"]:
                 self._decide(loc, *key, gross, net, cap, f"deny:venue_exposure:{ex}")
                 return
-        # ── ОГОНЬ: две IOC-ноги ──
+        # ── выбор схемы по профилю связки ──
+        scheme = self._pick_scheme(ev.sym, ev.buy_ex, ev.sell_ex, loc)
+        if scheme == "maker":
+            self._enter_maker(ev, bq, sq, loc, key, gross, cap, notional)
+            return
+        # ── TAKER-TAKER: две IOC-ноги ──
         qty = notional / bq.ask
         cur = self.store.q(
             "INSERT INTO trades(run,sym,buy_ex,sell_ex,t_open,status,qty,notional_usd,"
-            "theor_gross_pct,theor_net_pct,pnl_usd) VALUES(?,?,?,?,?,?,?,?,?,?,0)",
+            "theor_gross_pct,theor_net_pct,pnl_usd,scheme) VALUES(?,?,?,?,?,?,?,?,?,?,0,'taker')",
             (self.run, ev.sym, ev.buy_ex, ev.sell_ex, loc, "entering", qty, notional,
              gross * 100, net * 100))
         tid = cur.lastrowid
         tr = Trade(tid, ev.sym, ev.buy_ex, ev.sell_ex, loc, qty=qty, notional=notional,
                    theor_gross=gross, theor_net=net, last_fund_mark=loc)
+        tr.scheme = "taker"
         self.trades[tid] = tr
-        self._decide(loc, *key, gross, net, cap, "trade", tid)
+        self._decide(loc, *key, gross, net, cap, "trade_taker", tid)
         tr.entry_orders = [
             self._submit(tid, "entry_buy", ev.buy_ex, ev.sym, "buy", "ioc",
                          bq.ask, qty, bq.ask, loc),
             self._submit(tid, "entry_sell", ev.sell_ex, ev.sym, "sell", "ioc",
                          sq.bid, qty, sq.bid, loc),
         ]
-        self.eng.log(f"ВХОД #{tid} {ev.sym} buy@{ev.buy_ex} {bq.ask:.6g} / "
+        self.eng.log(f"ВХОД[taker] #{tid} {ev.sym} buy@{ev.buy_ex} {bq.ask:.6g} / "
                      f"sell@{ev.sell_ex} {sq.bid:.6g} qty={qty:.4g} "
                      f"(${notional:.0f}, net {net*100:+.2f}%)")
+
+    # ---------- MAKER-FIRST: пассивная нога на дешёвой бирже ----------
+    def _enter_maker(self, ev, bq, sq, loc, key, gross, cap, notional):
+        c = self.cfg["maker"]
+        P = bq.bid                                       # встаём в лучший бид (мейкер)
+        fee_cycle = (self.maker_fees.get(ev.buy_ex, 2e-4) + self.fees[ev.sell_ex]
+                     + self.fees[ev.buy_ex] + self.fees[ev.sell_ex])
+        exp_net = sq.bid / P - 1.0 - fee_cycle
+        if exp_net * 100 < c["net_min_pct"]:
+            self._decide(loc, *key, gross, exp_net, cap, "deny:maker_net")
+            return
+        qty = notional / P
+        cur = self.store.q(
+            "INSERT INTO trades(run,sym,buy_ex,sell_ex,t_open,status,qty,notional_usd,"
+            "theor_gross_pct,theor_net_pct,pnl_usd,scheme) VALUES(?,?,?,?,?,?,?,?,?,?,0,'maker')",
+            (self.run, ev.sym, ev.buy_ex, ev.sell_ex, loc, "maker_wait", qty, notional,
+             gross * 100, exp_net * 100))
+        tid = cur.lastrowid
+        tr = Trade(tid, ev.sym, ev.buy_ex, ev.sell_ex, loc, qty=qty, notional=notional,
+                   theor_gross=gross, theor_net=exp_net, last_fund_mark=loc)
+        tr.scheme = "maker"
+        tr.status = "maker_wait"
+        self.trades[tid] = tr
+        self._decide(loc, *key, gross, exp_net, cap, "trade_maker", tid)
+        self.n_orders += 1
+        ow = self.rtt.get(ev.buy_ex, self.cfg["latency"]["default_one_way_ms"])
+        o = POrder(self.n_orders, tid, "entry_maker", ev.buy_ex, ev.sym, "buy", "maker",
+                   P, qty, P, loc, int(loc + ow))
+        tr.entry_orders = [o]
+        self.makers.setdefault(ev.sym, []).append(o)
+        self.eng.log(f"ВХОД[maker] #{tid} {ev.sym}: лимитка buy@{ev.buy_ex} {P:.6g} "
+                     f"(референс sell@{ev.sell_ex} {sq.bid:.6g}, ож.net {exp_net*100:+.2f}%)")
+
+    def _maker_tick(self, sym, loc):
+        """Каждый тик символа: наливы/репрайсы/отмены пассивных заявок."""
+        lst = self.makers.get(sym)
+        if not lst:
+            return
+        c = self.cfg["maker"]
+        for o in list(lst):
+            if o.arrival > loc:
+                continue                                 # заявка ещё летит на биржу
+            tr = self.trades.get(o.trade_id)
+            if tr is None:
+                lst.remove(o)
+                continue
+            book = self.eng.books.get(sym, {})
+            bq, sq = book.get(tr.buy_ex), book.get(tr.sell_ex)
+            if not bq or not sq or bq.bid <= 0 or sq.bid <= 0:
+                continue
+            # 1) налив: цена прошла СКВОЗЬ наш уровень (строгое правило очереди)
+            if bq.ask < o.limit_px * (1 - 1e-12):
+                lst.remove(o)
+                o.status, o.fill_px, o.fill_qty = "filled", o.limit_px, o.qty
+                o.fee_usd = o.qty * o.limit_px * self.maker_fees.get(o.venue, 2e-4)
+                tr.fees += o.fee_usd
+                self.cash[o.venue] = self.cash.get(o.venue, 0.0) - o.fee_usd
+                self._order_row(o, loc)
+                h = self._submit(tr.trade_id, "entry_sell", tr.sell_ex, sym, "sell",
+                                 "taker", None, o.qty, sq.bid, loc)
+                tr.entry_orders = [o, h]
+                tr.status = "entering"
+                self.mk_watch.append((loc + c["markout_s"] * 1000, tr.trade_id, sym,
+                                      tr.sell_ex, o.limit_px, sq.bid))
+                self.eng.log(f"НАЛИВ[maker] #{tr.trade_id} {sym} @{o.limit_px:.6g} — хеджирую")
+                continue
+            # 2) отмена: ожидаемый чистый упал ниже порога или TTL
+            fee_cycle = (self.maker_fees.get(tr.buy_ex, 2e-4) + self.fees[tr.sell_ex]
+                         + self.fees[tr.buy_ex] + self.fees[tr.sell_ex])
+            exp_net = sq.bid / o.limit_px - 1.0 - fee_cycle
+            if exp_net * 100 < c["cancel_net_pct"] or loc - o.created > c["ttl_s"] * 1000:
+                lst.remove(o)
+                o.status = "cancelled"
+                self._order_row(o, loc)
+                self._cancel_maker(tr, loc, "maker_cancel" if exp_net * 100
+                                   < c["cancel_net_pct"] else "maker_ttl")
+                continue
+            # 3) репрайс: следуем за лучшим бидом (paper: очередь теряем, это ок)
+            if abs(bq.bid / o.limit_px - 1) > 2e-4:
+                o.limit_px = bq.bid
+
+    def _cancel_maker(self, tr: Trade, loc, reason):
+        self.store.q("UPDATE trades SET t_close=?, status='closed', exit_reason=?, "
+                     "pnl_usd=0, hold_ms=? WHERE trade_id=?",
+                     (loc, reason, loc - tr.t_open, tr.trade_id))
+        self.trades.pop(tr.trade_id, None)
+
+    def _order_row(self, o: POrder, loc):
+        self.store.q(
+            "INSERT INTO orders(trade_id,leg,venue,sym,side,otype,limit_px,qty,"
+            "decision_px,created_ms,arrival_ms,resolved_ms,status,fill_px,fill_qty,fee_usd) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (o.trade_id, o.leg, o.venue, o.sym, o.side, o.otype, o.limit_px, o.qty,
+             o.decision_px, o.created, o.arrival, loc, o.status, o.fill_px, o.fill_qty,
+             o.fee_usd))
 
     # ---------- ордера ----------
     def _submit(self, tid, leg, venue, sym, side, otype, limit_px, qty, decision_px, loc):
@@ -271,6 +403,7 @@ class Forward:
                 for o in ready:
                     lst.remove(o)
                     self._resolve(o, q, loc)
+            self._maker_tick(sym, loc)
             self._monitor_exits(exch, sym, loc)
         except Exception as e:
             self.eng.log(f"quote hook error: {type(e).__name__}: {e}")
@@ -294,6 +427,17 @@ class Forward:
                         self._start_exit(tr, loc, "timeout")
                     else:
                         self._accrue_funding(tr, loc)
+            for sym in list(self.makers):                       # TTL в тихих стаканах
+                self._maker_tick(sym, loc)
+            due = [m for m in self.mk_watch if m[0] <= loc]     # маркауты
+            for m in due:
+                self.mk_watch.remove(m)
+                _, tid, sym, venue, fill_px, ref0 = m
+                q = self.eng.books.get(sym, {}).get(venue)
+                if q and q.bid > 0 and ref0 > 0:
+                    self.store.q("INSERT INTO markouts VALUES(?,?,?,?,?,?,?,?)",
+                                 (loc, tid, sym, venue, fill_px, ref0, q.bid,
+                                  (q.bid / ref0 - 1) * 1e4))
 
     # ---------- завершение входа ----------
     def _finish_entry(self, tr: Trade, loc):
@@ -429,11 +573,14 @@ async def main():
     ap.add_argument("--max-symbols", type=int, default=0)
     ap.add_argument("--minutes", type=float, default=0)
     ap.add_argument("--entry-net", type=float, default=None, help="override entry.net_min_pct")
+    ap.add_argument("--scheme", choices=["auto", "taker", "maker"], default=None)
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(os.path.join(ROOT, "forward.yaml"), encoding="utf-8"))
     if args.entry_net is not None:
         cfg["entry"]["net_min_pct"] = args.entry_net
+    if args.scheme is not None:
+        cfg["scheme"]["mode"] = args.scheme
     cfg_json = json.dumps(cfg, sort_keys=True)
     cfg_hash = hashlib.sha256(cfg_json.encode()).hexdigest()[:12]
     run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{cfg_hash[:6]}"
@@ -469,6 +616,7 @@ async def main():
         store.q("INSERT INTO config_runs VALUES(?,?,?,?)",
                 (run_id, now_ms(), cfg_hash, cfg_json))
         fwd = Forward(cfg, eng, store, fees, run_id)
+        fwd.maker_fees = {ex: CONNECTORS[ex].maker for ex in want}
         for ex in want:
             fwd.cash[ex] = float(cfg["paper"]["cash_per_venue_usd"])
 

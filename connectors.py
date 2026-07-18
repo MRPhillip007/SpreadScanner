@@ -49,6 +49,7 @@ def split_scale(sym: str) -> tuple[str, float]:
 class Connector:
     name = "base"
     taker = 0.0005
+    maker = 0.0002
 
     def __init__(self, engine, session: aiohttp.ClientSession, symbols: list[str],
                  native_map: dict | None = None):
@@ -85,6 +86,7 @@ class Connector:
 class Binance(Connector):
     name = "binance"
     taker = 0.0005
+    maker = 0.0002
     REST = "https://fapi.binance.com"
     WS = "wss://fstream.binance.com/stream"
     CHUNK = 80
@@ -154,6 +156,7 @@ class Binance(Connector):
 class Bybit(Connector):
     name = "bybit"
     taker = 0.00055
+    maker = 0.0002
     REST = "https://api.bybit.com"
     WS = "wss://stream.bybit.com/v5/public/linear"
 
@@ -241,6 +244,7 @@ class Bybit(Connector):
 class Gate(Connector):
     name = "gate"
     taker = 0.0005
+    maker = 0.0002
     REST = "https://api.gateio.ws/api/v4"
     WS = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 
@@ -338,6 +342,7 @@ class Gate(Connector):
 class Okx(Connector):
     name = "okx"
     taker = 0.0005
+    maker = 0.0002
     REST = "https://www.okx.com"
     WS = "wss://ws.okx.com:8443/ws/v5/public"
 
@@ -430,6 +435,7 @@ class Okx(Connector):
 class Mexc(Connector):
     name = "mexc"
     taker = 0.0002
+    maker = 0.0
     REST = "https://contract.mexc.com"
     WS = "wss://contract.mexc.com/edge"
     CHUNK = 120
@@ -519,6 +525,7 @@ class Mexc(Connector):
 class Bitget(Connector):
     name = "bitget"
     taker = 0.0006
+    maker = 0.0002
     REST = "https://api.bitget.com"
     WS = "wss://ws.bitget.com/v2/ws/public"
 
