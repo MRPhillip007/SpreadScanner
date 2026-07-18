@@ -480,6 +480,7 @@ class Forward:
                              (loc, "trim", tr.trade_id,
                               json.dumps(dict(venue=ex.venue, excess=excess, cost=cost))))
         tr.status = "open"
+        self.store.q("UPDATE trades SET status='open' WHERE trade_id=?", (tr.trade_id,))
         self.eng.log(f"ОТКРЫТА #{tr.trade_id} {tr.sym} qty={m:.4g} "
                      f"({tr.buy_ex} {ob.fill_px:.6g} / {tr.sell_ex} {os_.fill_px:.6g})")
 

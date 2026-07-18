@@ -43,6 +43,13 @@ def summary():
                 decisions=dec, exit_reasons=reasons)
 
 
+@app.get("/api/positions")
+def positions():
+    return q("""SELECT trade_id, scheme, sym, buy_ex, sell_ex, t_open, status,
+                notional_usd, theor_net_pct FROM trades
+                WHERE status != 'closed' ORDER BY t_open DESC LIMIT 50""")
+
+
 @app.get("/api/trades")
 def trades(limit: int = 100):
     return q("""SELECT trade_id, scheme, sym, buy_ex, sell_ex, t_open, t_close, qty,
@@ -77,6 +84,7 @@ border:1px solid #232a35;border-radius:8px;padding:10px 16px;margin:4px 8px 4px 
 .card b{font-size:17px}.muted{color:#7b8794}
 </style>
 <div id="cards"></div>
+<h2>Открытые связки (держат слоты)</h2><table id="pos"></table>
 <h2>Причины выходов</h2><table id="reasons"></table>
 <h2>Последние сделки</h2><table id="trades"></table>
 <h2>Решения (вкл. отказы)</h2><table id="dec"></table>
@@ -97,6 +105,14 @@ async function tick(){
   `<div class=card>PnL <b>${pn(s.trades.pnl)}</b><br><span class=muted>слип ${
      pn(s.trades.slip)} · комис ${s.trades.fees.toFixed(2)} · фанд ${pn(s.trades.funding)}</span></div>`+
   `<div class=card>Leg-risk <b>${s.leg_risk}</b></div>`;
+ const ps=await f('/api/positions');
+ document.getElementById('pos').innerHTML=
+  '<tr><th>#</th><th>схема</th><th>символ</th><th>пара</th><th>$</th><th>теор.net%</th><th>статус</th><th>висит мин</th></tr>'+
+  ps.map(p=>`<tr><td>${p.trade_id}</td><td>${p.scheme}</td><td>${p.sym}</td>
+   <td>${p.buy_ex}→${p.sell_ex}</td><td>${p.notional_usd.toFixed(0)}</td>
+   <td>${p.theor_net_pct.toFixed(2)}</td><td>${p.status}</td>
+   <td>${((Date.now()-p.t_open)/60000).toFixed(1)}</td></tr>`).join('')
+  || '<tr><td class=muted>нет</td></tr>';
  document.getElementById('reasons').innerHTML='<tr><th>причина</th><th>сделок</th><th>PnL $</th></tr>'+
   s.exit_reasons.map(r=>`<tr><td>${r.exit_reason}</td><td>${r.n}</td><td>${pn(r.pnl)}</td></tr>`).join('');
  const tr=await f('/api/trades?limit=40');
