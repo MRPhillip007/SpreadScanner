@@ -38,7 +38,8 @@ from connectors import CONNECTORS
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(ROOT, "data")
 
-OPEN_GROSS = 0.30 / 100          # порог открытия события (валовый спред)
+OPEN_GROSS = float(os.environ.get("OPEN_GROSS_PCT", "0.30")) / 100   # порог события
+                                 # (на быстром сервере можно опустить: OPEN_GROSS_PCT=0.20)
 CLOSE_GROSS = 0.10 / 100         # порог закрытия (гистерезис)
 MAX_QUOTE_AGE_MS = 10_000        # встречная нога свежее N мс, иначе пара не считается
                                  # (bookTicker пушится на каждое изменение: в активном
