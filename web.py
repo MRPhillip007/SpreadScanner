@@ -17,12 +17,14 @@ app = FastAPI(title="Spread Forward")
 def q(sql, args=()):
     if not os.path.exists(DB):
         return []
-    db = sqlite3.connect(f"file:{DB.replace(chr(92), '/')}?mode=ro", uri=True)
+    db = sqlite3.connect(DB, timeout=2)
     db.row_factory = sqlite3.Row
     try:
+        db.execute("PRAGMA query_only=ON")   # защита от записи вместо mode=ro
+        db.execute("PRAGMA busy_timeout=2000")
         return [dict(r) for r in db.execute(sql, args).fetchall()]
     except sqlite3.OperationalError:
-        return []                      # БД ещё инициализируется — отдадим пусто
+        return []                            # писатель в транзакции — отдадим пусто, не 500
     finally:
         db.close()
 

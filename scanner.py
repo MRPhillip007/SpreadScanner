@@ -222,6 +222,9 @@ class Store:
         except sqlite3.OperationalError:
             pass                                           # колонка уже есть
         self.db.execute("CREATE INDEX IF NOT EXISTS ix_ev_t ON events(t_open)")
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=NORMAL")
+        self.db.execute("PRAGMA busy_timeout=5000")
         self.db.commit()
 
     def flush(self, eng: Engine):

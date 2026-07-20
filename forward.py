@@ -86,6 +86,9 @@ class FStore:
             self.db.execute("ALTER TABLE trades ADD COLUMN scheme TEXT DEFAULT 'taker'")
         except sqlite3.OperationalError:
             pass
+        self.db.execute("PRAGMA journal_mode=WAL")      # читатели не блокируются
+        self.db.execute("PRAGMA synchronous=NORMAL")
+        self.db.execute("PRAGMA busy_timeout=5000")
         self.db.commit()
 
     def q(self, sql, args=()):
