@@ -744,9 +744,13 @@ async def main():
 
         async def funding_poll():
             while True:
+                ts = now_ms()
                 for ex in want:
                     try:
-                        fwd.funding[ex] = await CONNECTORS[ex].fetch_funding(session)
+                        f = await CONNECTORS[ex].fetch_funding(session)
+                        fwd.funding[ex] = f
+                        eng.fund_buf += [(ts, ex, s, r) for s, r in f.items()
+                                         if s in common]        # история в parquet
                     except Exception:
                         pass
                 await asyncio.sleep(60)

@@ -1,2 +1,6 @@
 data/
 __pycache__/
+data_nl/
+data/
+__pycache__/
+*.zip
