@@ -745,8 +745,9 @@ async def main():
             while True:
                 await asyncio.sleep(30)
                 ts = now_ms()
-                eng.snapshot()                          # 30с-снапшот книг + сброс буферов
-                sc_store.flush(eng)
+                eng.snapshot()                          # быстрый снапшот книг (в лупе)
+                bufs = eng.take_buffers()
+                await asyncio.to_thread(sc_store.write, bufs)   # диск — в фоновом потоке
                 for ex in want:
                     store.q("INSERT INTO equity VALUES(?,?,?)", (ts, ex, fwd.cash.get(ex, 0)))
                 for c in conns:

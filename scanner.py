@@ -206,11 +206,19 @@ class Engine:
                     self.snap_buf.append((loc, exch, sym, q.bid, q.bq, q.ask, q.aq,
                                           q.exch_ts, q.loc_ts))
 
+    def take_buffers(self) -> dict:
+        """Атомарно (в event-loop'е) забрать буферы для записи в фоновом потоке."""
+        out = dict(snap=self.snap_buf, ticks=self.tick_buf,
+                   fund=self.fund_buf, events=self.done_events)
+        self.snap_buf, self.tick_buf, self.fund_buf, self.done_events = [], [], [], []
+        return out
+
 
 class Store:
     def __init__(self):
         os.makedirs(DATA, exist_ok=True)
-        self.db = sqlite3.connect(os.path.join(DATA, "opportunities.db"))
+        self.db = sqlite3.connect(os.path.join(DATA, "opportunities.db"),
+                                  check_same_thread=False)
         self.db.execute("""CREATE TABLE IF NOT EXISTS events(
             sym TEXT, buy_ex TEXT, sell_ex TEXT, forced INT, t_open INT, t_close INT,
             dur_ms INT, max_gross_pct REAL, net_after_4taker_pct REAL,
@@ -227,37 +235,31 @@ class Store:
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.commit()
 
-    def flush(self, eng: Engine):
-        if eng.done_events:
-            df = pd.DataFrame(eng.done_events)
-            df.to_sql("events", self.db, if_exists="append", index=False)
+    def write(self, bufs: dict):
+        """Чистый I/O: зовётся из ФОНОВОГО потока. Каждый сброс — НОВЫЙ файл-кусок
+        (никаких перечитываний растущих parquet — они блокировали event-loop
+        на секунды и роняли все сокеты разом). Анализ читает по glob-маске."""
+        tag = time.strftime("%Y%m%d_%H%M%S")
+        if bufs.get("events"):
+            pd.DataFrame(bufs["events"]).to_sql("events", self.db,
+                                                if_exists="append", index=False)
             self.db.commit()
-            eng.done_events.clear()
-        hour = time.strftime("%Y%m%d_%H")
-        if eng.snap_buf:
-            df = pd.DataFrame(eng.snap_buf, columns=["ts", "exch", "sym", "bid", "bq",
-                                                     "ask", "aq", "exch_ts", "loc_ts"])
-            p = os.path.join(DATA, f"snap_{hour}.parquet")
-            if os.path.exists(p):
-                df = pd.concat([pd.read_parquet(p), df], ignore_index=True)
-            df.to_parquet(p, index=False)
-            eng.snap_buf.clear()
-        if eng.tick_buf:
-            df = pd.DataFrame(eng.tick_buf, columns=["ts", "sym", "buy_ex", "sell_ex",
-                                                     "buy_ask", "buy_askqty",
-                                                     "sell_bid", "sell_bidqty", "gross"])
-            p = os.path.join(DATA, f"event_ticks_{time.strftime('%Y%m%d')}.parquet")
-            if os.path.exists(p):
-                df = pd.concat([pd.read_parquet(p), df], ignore_index=True)
-            df.to_parquet(p, index=False)
-            eng.tick_buf.clear()
-        if eng.fund_buf:
-            df = pd.DataFrame(eng.fund_buf, columns=["ts", "exch", "sym", "funding"])
-            p = os.path.join(DATA, f"funding_{time.strftime('%Y%m%d')}.parquet")
-            if os.path.exists(p):
-                df = pd.concat([pd.read_parquet(p), df], ignore_index=True)
-            df.to_parquet(p, index=False)
-            eng.fund_buf.clear()
+        if bufs.get("snap"):
+            pd.DataFrame(bufs["snap"], columns=["ts", "exch", "sym", "bid", "bq",
+                                                "ask", "aq", "exch_ts", "loc_ts"]
+                         ).to_parquet(os.path.join(DATA, f"snap_{tag}.parquet"), index=False)
+        if bufs.get("ticks"):
+            pd.DataFrame(bufs["ticks"], columns=["ts", "sym", "buy_ex", "sell_ex",
+                                                 "buy_ask", "buy_askqty",
+                                                 "sell_bid", "sell_bidqty", "gross"]
+                         ).to_parquet(os.path.join(DATA, f"event_ticks_{tag}.parquet"), index=False)
+        if bufs.get("fund"):
+            pd.DataFrame(bufs["fund"], columns=["ts", "exch", "sym", "funding"]
+                         ).to_parquet(os.path.join(DATA, f"funding_{tag}.parquet"), index=False)
+
+    def flush(self, eng: Engine):
+        """Синхронный путь (останов/малые прогоны)."""
+        self.write(eng.take_buffers())
 
 
 async def main():
@@ -339,7 +341,8 @@ async def main():
         async def flusher():
             while True:
                 await asyncio.sleep(FLUSH_EVERY)
-                store.flush(eng)
+                bufs = eng.take_buffers()              # swap в event-loop'е — мгновенно
+                await asyncio.to_thread(store.write, bufs)
 
         async def funder():
             while True:
