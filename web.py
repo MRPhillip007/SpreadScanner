@@ -15,27 +15,41 @@ app = FastAPI(title="Spread Forward")
 
 
 def q(sql, args=()):
-    db = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    if not os.path.exists(DB):
+        return []
+    db = sqlite3.connect(f"file:{DB.replace(chr(92), '/')}?mode=ro", uri=True)
     db.row_factory = sqlite3.Row
     try:
         return [dict(r) for r in db.execute(sql, args).fetchall()]
+    except sqlite3.OperationalError:
+        return []                      # БД ещё инициализируется — отдадим пусто
     finally:
         db.close()
 
 
+EMPTY_TR = dict(n=0, pnl=0, avg_pnl=0, wins=0, fees=0, slip=0, funding=0, avg_hold_s=0)
+
+
 @app.get("/api/summary")
 def summary():
-    eq = q("SELECT venue, cash FROM equity WHERE ts=(SELECT MAX(ts) FROM equity WHERE venue=equity.venue) GROUP BY venue")
+    if not os.path.exists(DB):
+        return dict(equity=[], trades=EMPTY_TR, no_fill=0, leg_risk=0, decisions=[],
+                    exit_reasons=[], note="БД не найдена — сначала запусти forward.py")
     eq = q("""SELECT venue, cash FROM equity e WHERE ts =
               (SELECT MAX(ts) FROM equity WHERE venue = e.venue)""")
-    tr = q("""SELECT COUNT(*) n, COALESCE(SUM(pnl_usd),0) pnl,
+    tr_rows = q("""SELECT COUNT(*) n, COALESCE(SUM(pnl_usd),0) pnl,
               COALESCE(AVG(pnl_usd),0) avg_pnl,
               SUM(CASE WHEN pnl_usd>0 THEN 1 ELSE 0 END) wins,
               COALESCE(SUM(fees_usd),0) fees, COALESCE(SUM(entry_slip_usd+exit_slip_usd),0) slip,
               COALESCE(SUM(funding_usd),0) funding, COALESCE(AVG(hold_ms)/1000.0,0) avg_hold_s
-              FROM trades WHERE status='closed' AND exit_reason NOT IN ('no_fill')""")[0]
-    nofill = q("SELECT COUNT(*) n FROM trades WHERE exit_reason='no_fill'")[0]["n"]
-    legr = q("SELECT COUNT(*) n FROM incidents WHERE kind='leg_risk'")[0]["n"]
+              FROM trades WHERE status='closed' AND exit_reason NOT IN ('no_fill')""")
+    tr = tr_rows[0] if tr_rows else EMPTY_TR
+    if tr.get("wins") is None:
+        tr["wins"] = 0
+    nf = q("SELECT COUNT(*) n FROM trades WHERE exit_reason='no_fill'")
+    nofill = nf[0]["n"] if nf else 0
+    lg = q("SELECT COUNT(*) n FROM incidents WHERE kind='leg_risk'")
+    legr = lg[0]["n"] if lg else 0
     dec = q("""SELECT action, COUNT(*) n FROM decisions GROUP BY action ORDER BY n DESC""")
     reasons = q("""SELECT exit_reason, COUNT(*) n, COALESCE(SUM(pnl_usd),0) pnl
                    FROM trades WHERE status='closed' GROUP BY exit_reason""")
@@ -97,6 +111,7 @@ async function tick(){
  const s=await f('/api/summary');
  let eqsum=s.equity.reduce((a,x)=>a+x.cash,0);
  document.getElementById('cards').innerHTML=
+  (s.note?`<div class=card style="border-color:#b8860b">⚠ ${s.note}</div>`:'')+
   `<div class=card>Эквити <b>$${eqsum.toFixed(2)}</b><br><span class=muted>${
      s.equity.map(x=>x.venue+' $'+x.cash.toFixed(0)).join(' · ')}</span></div>`+
   `<div class=card>Сделок <b>${s.trades.n}</b><br><span class=muted>WR ${
