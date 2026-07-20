@@ -43,7 +43,7 @@ DB = os.path.join(DATA, "forward.db")
 
 RTT_PROBE = {                                      # лёгкий эндпоинт для замера RTT
     "binance": "/fapi/v1/time", "bybit": "/v5/market/time",
-    "okx": "/api/v5/public/time", "gate": "/futures/usdt/contracts/BTC_USDT",
+    "okx": "/api/v5/public/time", "gate": "/spot/time",
     "mexc": "/api/v1/contract/ping", "bitget": "/api/v2/public/time",
 }
 FUNDING_HOURS = (0, 8, 16)                         # приближение: начисление в 00/08/16 UTC
