@@ -115,8 +115,13 @@ class Engine:
         loc = now_ms()
         self.conn_last[exch] = loc
         q = self.books.setdefault(sym, {}).setdefault(exch, Quote())
+        unchanged = (bid == q.bid and ask == q.ask)
         q.bid, q.bq, q.ask, q.aq, q.exch_ts, q.loc_ts = bid, bq, ask, aq, exch_ts, loc
-        book = self.books[sym]
+        if self.on_quote_hook is not None:
+            self.on_quote_hook(exch, sym, q, loc)
+        if unchanged:
+            return                                     # поменялись только размеры:
+        book = self.books[sym]                         # спред тот же, пары не считаем
         if len(book) < 2:
             return
         for other, oq in book.items():
@@ -130,8 +135,6 @@ class Engine:
             self._check(sym, exch, other, q, oq, loc)
             # направление 2: купить на other, продать на exch
             self._check(sym, other, exch, oq, q, loc)
-        if self.on_quote_hook is not None:
-            self.on_quote_hook(exch, sym, q, loc)
 
     def _check(self, sym, buy_ex, sell_ex, bq_, sq_, loc):
         pkey = (sym,) + tuple(sorted((buy_ex, sell_ex)))

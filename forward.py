@@ -162,6 +162,7 @@ class Forward:
         self.last_eval: dict[tuple, int] = {}
         self.day_pnl: dict[int, float] = {}
         self.pair_hist: dict[tuple, list] = {}                  # профиль связки: t_close событий
+        self.by_sym: dict[str, list] = {}                       # sym -> [trade_id] открытых
         self.mk_watch: list = []                                # маркауты: (due, tid, sym, ...)
         self.maker_fees = {}
         self.n_orders = 0
@@ -261,6 +262,7 @@ class Forward:
                    theor_gross=gross, theor_net=net, last_fund_mark=loc)
         tr.scheme = "taker"
         self.trades[tid] = tr
+        self.by_sym.setdefault(ev.sym, []).append(tid)
         self._decide(loc, *key, gross, net, cap, "trade_taker", tid)
         tr.entry_orders = [
             self._submit(tid, "entry_buy", ev.buy_ex, ev.sym, "buy", "ioc",
@@ -296,6 +298,7 @@ class Forward:
         tr.scheme = "maker"
         tr.status = "maker_wait"
         self.trades[tid] = tr
+        self.by_sym.setdefault(ev.sym, []).append(tid)
         self._decide(loc, *key, gross, exp_net, cap, "trade_maker", tid)
         self.n_orders += 1
         ow = self.rtt.get(ev.buy_ex, self.cfg["latency"]["default_one_way_ms"])
@@ -395,6 +398,8 @@ class Forward:
                      "pnl_usd=0, hold_ms=? WHERE trade_id=?",
                      (loc, reason, loc - tr.t_open, tr.trade_id))
         self.trades.pop(tr.trade_id, None)
+        if tr.trade_id in self.by_sym.get(tr.sym, []):
+            self.by_sym[tr.sym].remove(tr.trade_id)
 
     def _order_row(self, o: POrder, loc):
         self.store.q(
@@ -536,9 +541,13 @@ class Forward:
 
     # ---------- выходы ----------
     def _monitor_exits(self, exch, sym, loc):
+        tids = self.by_sym.get(sym)
+        if not tids:
+            return
         c = self.cfg["exit"]
-        for tr in list(self.trades.values()):
-            if tr.status != "open" or tr.sym != sym or exch not in (tr.buy_ex, tr.sell_ex):
+        for tid in list(tids):
+            tr = self.trades.get(tid)
+            if tr is None or tr.status != "open" or exch not in (tr.buy_ex, tr.sell_ex):
                 continue
             book = self.eng.books.get(sym, {})
             bq, sq = book.get(tr.buy_ex), book.get(tr.sell_ex)
@@ -616,6 +625,8 @@ class Forward:
         self.cooldown[key] = max(self.cooldown[key],
                                  loc + self.cfg["risk"]["pair_cooldown_s"] * 1000)
         self.trades.pop(tr.trade_id, None)
+        if tr.trade_id in self.by_sym.get(tr.sym, []):
+            self.by_sym[tr.sym].remove(tr.trade_id)
         self.eng.log(f"ЗАКРЫТА #{tr.trade_id} {tr.sym} [{tr.exit_reason}] "
                      f"PnL ${pnl:+.2f} (теор net {tr.theor_net*100:+.2f}%, "
                      f"слип вх ${tr.entry_slip:+.2f} / вых ${tr.exit_slip:+.2f}, "
