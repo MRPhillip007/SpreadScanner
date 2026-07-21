@@ -81,15 +81,23 @@ async def bench_one(name, cfg, session):
         async with session.get(cfg["time"], timeout=aiohttp.ClientTimeout(total=10)) as r:
             await r.read()
         out["rest_cold"] = (time.perf_counter() - t0) * 1000
-        rtts, offs = [], []
+        rtts, offs, last_err = [], [], ""
         for _ in range(N_REST):
+            await asyncio.sleep(0.25)                  # не долбить рейт-лимиты
             t0w = time.time() * 1000
             p0 = time.perf_counter()
             async with session.get(cfg["time"], timeout=aiohttp.ClientTimeout(total=10)) as r:
-                j = loads(await r.read())
+                body = await r.read()
             rtt = (time.perf_counter() - p0) * 1000
-            rtts.append(rtt)
-            offs.append((cfg["t"](j) - (t0w + rtt / 2), rtt))
+            try:
+                j = loads(body)
+                offs.append((cfg["t"](j) - (t0w + rtt / 2), rtt))
+                rtts.append(rtt)
+            except Exception:                          # плохой сэмпл — пропустить
+                last_err = body[:80].decode(errors="replace")
+        if len(rtts) < 5:
+            out["rest_err"] = f"мало валидных сэмплов ({len(rtts)}): {last_err}"
+            return out
         out["rest_min"] = min(rtts)
         out["rest_med"] = pct(rtts, 50)
         out["rest_p99"] = pct(rtts, 99)
