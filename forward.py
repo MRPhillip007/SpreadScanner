@@ -116,6 +116,7 @@ class POrder:
     fill_px: float = 0.0
     fill_qty: float = 0.0
     fee_usd: float = 0.0
+    last_q_ts: int = 0            # G: котировка, уже израсходованная этим тейкером
 
 
 @dataclass
@@ -142,6 +143,7 @@ class Trade:
     last_fund_mark: int = 0
     exit_reason: str = ""
     scheme: str = "taker"
+    conv_since: int = 0           # E2: начало подтверждаемого окна схождения
 
 
 class Forward:
@@ -163,6 +165,7 @@ class Forward:
         self.day_pnl: dict[int, float] = {}
         self.pair_hist: dict[tuple, list] = {}                  # профиль связки: t_close событий
         self.by_sym: dict[str, list] = {}                       # sym -> [trade_id] открытых
+        self.link_hist: dict[tuple, list] = {}                  # kill-switch: (t_close, pnl)
         self.mk_watch: list = []                                # маркауты: (due, tid, sym, ...)
         self.maker_fees = {}
         self.n_orders = 0
@@ -362,10 +365,26 @@ class Forward:
 
     def _exit_maker_tick(self, o: POrder, tr: Trade, lst, book, loc):
         """Пассивная закрывающая лимитка: налив по строгому проходу, репрайс за
-        своей стороной, эскалация в тейкер по passive_ttl."""
+        своей стороной, эскалация в тейкер по passive_ttl или при уходе к стопу."""
         q = book.get(o.venue)
         if not q or q.bid <= 0:
             return
+        # спред разошёлся к стопу во время пассивного выхода -> срочность настоящая
+        bq2, sq2 = book.get(tr.buy_ex), book.get(tr.sell_ex)
+        if bq2 and sq2 and bq2.ask > 0 and sq2.bid > 0:
+            gross_now = sq2.bid / bq2.ask - 1.0
+            if (gross_now - tr.theor_gross) * 100 >= self.cfg["exit"]["stop_widen_pct"]:
+                lst.remove(o)
+                o.status = "cancelled"
+                self._order_row(o, loc)
+                dpx = q.bid if o.side == "sell" else q.ask
+                t = self._submit(tr.trade_id, o.leg, o.venue, o.sym, o.side, "taker",
+                                 None, o.qty, dpx, loc)
+                tr.exit_orders = [t if x is o else x for x in tr.exit_orders]
+                tr.exit_reason = "stop_widen"
+                self.eng.log(f"ЭСКАЛАЦИЯ-СТОП #{tr.trade_id} {o.sym} {o.leg}: "
+                             f"спред разошёлся во время пассивного выхода — тейкер")
+                return
         through = (q.bid > o.limit_px * (1 + 1e-12)) if o.side == "sell" \
             else (q.ask < o.limit_px * (1 - 1e-12))
         if through:
@@ -422,24 +441,50 @@ class Forward:
     def _resolve(self, o: POrder, q: SC.Quote, loc):
         px = q.ask if o.side == "buy" else q.bid
         avail = q.aq if o.side == "buy" else q.bq
-        filled = 0.0
-        if o.otype == "taker" or (o.side == "buy" and px <= o.limit_px + 1e-15) \
-                or (o.side == "sell" and px >= o.limit_px - 1e-15):
-            filled = min(o.qty, avail if avail > 0 else o.qty)
-        o.status = "filled" if filled >= o.qty * 0.999 else ("partial" if filled > 0 else "missed")
-        o.fill_px, o.fill_qty = (px, filled) if filled > 0 else (0.0, 0.0)
-        o.fee_usd = filled * px * self.fees[o.venue]
-        self.store.q(
-            "INSERT INTO orders(trade_id,leg,venue,sym,side,otype,limit_px,qty,"
-            "decision_px,created_ms,arrival_ms,resolved_ms,status,fill_px,fill_qty,fee_usd) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (o.trade_id, o.leg, o.venue, o.sym, o.side, o.otype, o.limit_px, o.qty,
-             o.decision_px, o.created, o.arrival, loc, o.status, o.fill_px, o.fill_qty,
-             o.fee_usd))
         tr = self.trades.get(o.trade_id)
+        if o.otype == "taker":
+            # G: тейкер добивает остаток по СЛЕДУЮЩИМ котировкам (не переиспользуя
+            # одну и ту же видимую вершину); старше TTL — принудительное закрытие
+            # остатка по текущей цене (модельное допущение, фиксируется инцидентом)
+            if q.loc_ts == o.last_q_ts:
+                self.pending.setdefault((o.venue, o.sym), []).append(o)
+                return
+            o.last_q_ts = q.loc_ts
+            remaining = o.qty - o.fill_qty
+            take = min(remaining, avail) if avail > 0 else remaining
+            if (loc - o.created > self.cfg["latency"].get("taker_fill_ttl_ms", 3000)
+                    and take < remaining):
+                self.store.q("INSERT INTO incidents VALUES(?,?,?,?)",
+                             (loc, "taker_forced_fill", o.trade_id,
+                              json.dumps(dict(leg=o.leg, rest=remaining - take))))
+                take = remaining
+            if take > 0:
+                o.fill_px = px if o.fill_qty <= 0 else \
+                    (o.fill_px * o.fill_qty + px * take) / (o.fill_qty + take)
+                fee = take * px * self.fees[o.venue]
+                o.fee_usd += fee
+                o.fill_qty += take
+                if tr:
+                    tr.fees += fee
+                    self.cash[o.venue] = self.cash.get(o.venue, 0.0) - fee
+            if o.fill_qty < o.qty * 0.999:
+                self.pending.setdefault((o.venue, o.sym), []).append(o)
+                return
+            o.status = "filled"
+        else:                                          # IOC: одноразовый по семантике
+            filled = 0.0
+            if (o.side == "buy" and px <= o.limit_px + 1e-15) \
+                    or (o.side == "sell" and px >= o.limit_px - 1e-15):
+                filled = min(o.qty, avail if avail > 0 else o.qty)
+            o.status = "filled" if filled >= o.qty * 0.999 else \
+                ("partial" if filled > 0 else "missed")
+            o.fill_px, o.fill_qty = (px, filled) if filled > 0 else (0.0, 0.0)
+            o.fee_usd = filled * px * self.fees[o.venue]
+            if tr and o.fee_usd:
+                tr.fees += o.fee_usd
+                self.cash[o.venue] = self.cash.get(o.venue, 0.0) - o.fee_usd
+        self._order_row(o, loc)
         if tr:
-            tr.fees += o.fee_usd
-            self.cash[o.venue] = self.cash.get(o.venue, 0.0) - o.fee_usd
             if tr.status == "entering" and all(x.status != "pending" for x in tr.entry_orders):
                 self._finish_entry(tr, loc)
             elif tr.status == "exiting" and all(x.status != "pending" for x in tr.exit_orders):
@@ -538,6 +583,18 @@ class Forward:
         self.store.q("UPDATE trades SET status='open' WHERE trade_id=?", (tr.trade_id,))
         self.eng.log(f"ОТКРЫТА #{tr.trade_id} {tr.sym} qty={m:.4g} "
                      f"({tr.buy_ex} {ob.fill_px:.6g} / {tr.sell_ex} {os_.fill_px:.6g})")
+        # ПРАВИЛО 2 (scratch): хедж мейкера исполнился хуже референса — план мёртв,
+        # фиксируем царапину сейчас, не высиживаем до converge/стопа
+        sb = self.cfg["maker"].get("scratch_bps", 0)
+        if tr.scheme == "maker" and sb > 0 and os_.decision_px > 0:
+            slip_bps = (os_.decision_px - os_.fill_px) / os_.decision_px * 1e4
+            if slip_bps >= sb:
+                self.eng.log(f"СКРЭТЧ #{tr.trade_id} {tr.sym}: хедж хуже плана на "
+                             f"{slip_bps:.0f} б.п. (порог {sb}) — выход обеих ног")
+                self.store.q("INSERT INTO incidents VALUES(?,?,?,?)",
+                             (loc, "scratch", tr.trade_id,
+                              json.dumps(dict(slip_bps=round(slip_bps, 1)))))
+                self._start_exit(tr, loc, "scratch", style="taker")
 
     # ---------- выходы ----------
     def _monitor_exits(self, exch, sym, loc):
@@ -545,6 +602,7 @@ class Forward:
         if not tids:
             return
         c = self.cfg["exit"]
+        mq = c.get("min_quote_usd", 0)
         for tid in list(tids):
             tr = self.trades.get(tid)
             if tr is None or tr.status != "open" or exch not in (tr.buy_ex, tr.sell_ex):
@@ -554,10 +612,21 @@ class Forward:
             if not bq or not sq or bq.ask <= 0 or sq.bid <= 0:
                 continue
             gross_now = sq.bid / bq.ask - 1.0
-            if gross_now * 100 <= c["converge_gross_pct"]:
-                self._start_exit(tr, loc, "converged", style="taker")
-            elif (gross_now - tr.theor_gross) * 100 >= c["stop_widen_pct"]:
-                self._start_exit(tr, loc, "stop_widen", style="taker")
+            if (gross_now - tr.theor_gross) * 100 >= c["stop_widen_pct"]:
+                self._start_exit(tr, loc, "stop_widen", style="taker")   # риск — немедленно
+                continue
+            # E2: схождение засчитывается, если держится confirm_ms подряд
+            # и показано котировками с реальным размером (не однолотовый миг)
+            size_ok = ((sq.bq <= 0 or sq.bid * sq.bq >= mq)
+                       and (bq.aq <= 0 or bq.ask * bq.aq >= mq))
+            if gross_now * 100 <= c["converge_gross_pct"] and size_ok:
+                if tr.conv_since == 0:
+                    tr.conv_since = loc
+                elif loc - tr.conv_since >= c.get("confirm_ms", 0):
+                    self._start_exit(tr, loc, "converged",
+                                     style=c.get("converged_style", "taker"))
+            else:
+                tr.conv_since = 0
 
     def _start_exit(self, tr: Trade, loc, reason, style: str = "taker"):
         tr.status = "exiting"
@@ -627,6 +696,25 @@ class Forward:
         self.trades.pop(tr.trade_id, None)
         if tr.trade_id in self.by_sym.get(tr.sym, []):
             self.by_sym[tr.sym].remove(tr.trade_id)
+        # ПАКЕТ 2: kill-switch связки — rolling PnL по позициям (не по отменам)
+        kc = self.cfg["risk"].get("link_kill")
+        if kc and tr.qty > 0:
+            kh = self.link_hist.setdefault(key, [])
+            kh.append((loc, pnl))
+            w = kc["window_min"] * 60_000
+            self.link_hist[key] = kh = [x for x in kh if x[0] > loc - w]
+            tot = sum(p for _, p in kh)
+            if len(kh) >= kc["min_trades"] and tot <= kc["max_pnl_usd"]:
+                self.cooldown[key] = max(self.cooldown[key],
+                                         loc + kc["pause_min"] * 60_000)
+                self.link_hist[key] = []
+                self.store.q("INSERT INTO incidents VALUES(?,?,?,?)",
+                             (loc, "link_kill", tr.trade_id,
+                              json.dumps(dict(link=list(key), n=len(kh),
+                                              pnl=round(tot, 2)))))
+                self.eng.log(f"KILL-SWITCH {key[0]} {key[1]}<->{key[2]}: "
+                             f"{len(kh)} сделок PnL {tot:+.2f}$ — пауза "
+                             f"{kc['pause_min']} мин")
         self.eng.log(f"ЗАКРЫТА #{tr.trade_id} {tr.sym} [{tr.exit_reason}] "
                      f"PnL ${pnl:+.2f} (теор net {tr.theor_net*100:+.2f}%, "
                      f"слип вх ${tr.entry_slip:+.2f} / вых ${tr.exit_slip:+.2f}, "
@@ -728,16 +816,22 @@ async def main():
         tasks.append(asyncio.create_task(fwd.sweeper()))
 
         async def rtt_probe():
+            n_samp = int(cfg["latency"].get("rtt_probe_samples", 3))
             while True:
                 for ex in want:
                     try:
                         url = CONNECTORS[ex].REST + RTT_PROBE[ex]
-                        t0 = time.perf_counter()
-                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as r:
-                            await r.read()
-                        rtt = (time.perf_counter() - t0) * 1000
-                        fwd.rtt[ex] = rtt / 2                   # односторонка
-                        store.q("INSERT INTO venue_rtt VALUES(?,?,?)", (now_ms(), ex, rtt))
+                        best = None                     # серия: первый греет TLS, берём min
+                        for _ in range(n_samp):
+                            t0 = time.perf_counter()
+                            async with session.get(url,
+                                                   timeout=aiohttp.ClientTimeout(total=5)) as r:
+                                await r.read()
+                            rtt = (time.perf_counter() - t0) * 1000
+                            best = rtt if best is None else min(best, rtt)
+                            await asyncio.sleep(0.15)
+                        fwd.rtt[ex] = best / 2          # односторонка по тёплой сети
+                        store.q("INSERT INTO venue_rtt VALUES(?,?,?)", (now_ms(), ex, best))
                     except Exception:
                         pass
                 await asyncio.sleep(60)
