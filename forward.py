@@ -794,6 +794,13 @@ async def main():
 if __name__ == "__main__":
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        try:
+            import ctypes
+            ctypes.windll.winmm.timeBeginPeriod(1)       # таймер ОС 15.6мс -> 1мс
+            ctypes.windll.kernel32.SetPriorityClass(     # HIGH_PRIORITY_CLASS
+                ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080)
+        except Exception:
+            pass
     else:
         try:
             import uvloop
