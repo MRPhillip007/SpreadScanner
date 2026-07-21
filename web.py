@@ -164,4 +164,5 @@ def index():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8100, log_level="warning")
+    uvicorn.run(app, host="127.0.0.1",
+                port=int(os.environ.get("PORT", "8100")), log_level="warning")
