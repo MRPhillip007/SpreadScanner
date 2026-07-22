@@ -20,7 +20,7 @@ Wants=network-online.target
 
 [Service]
 WorkingDirectory=$D
-Environment=OPEN_GROSS_PCT=0.20
+Environment=OPEN_GROSS_PCT=0.40
 ExecStart=$D/.venv/bin/python $D/forward.py --exchanges binance,bybit,gate,okx,bitget
 Restart=always
 RestartSec=5

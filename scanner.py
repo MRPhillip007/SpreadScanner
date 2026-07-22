@@ -38,8 +38,13 @@ from connectors import CONNECTORS
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(ROOT, "data")
 
-OPEN_GROSS = float(os.environ.get("OPEN_GROSS_PCT", "0.30")) / 100   # порог события
-                                 # (на быстром сервере можно опустить: OPEN_GROSS_PCT=0.20)
+OPEN_GROSS = float(os.environ.get("OPEN_GROSS_PCT", "0.40")) / 100   # порог события
+                                 # (0.40 с 22.07: медиана gross у РЕАЛЬНЫХ входов 0.55%+,
+                                 # а порог 0.2-0.3 генерировал 2.3М пустых deny-решений/день)
+EXCH_STALE_MS = int(os.environ.get("EXCH_STALE_MS", "1500"))
+                                 # котировка с биржевым таймстемпом старше N мс = протухшая
+                                 # (бэклог обработки) -> пары не считаем; требует точных
+                                 # часов (chrony/w32tm); 0 = выключить
 CLOSE_GROSS = 0.10 / 100         # порог закрытия (гистерезис)
 MAX_QUOTE_AGE_MS = 10_000        # встречная нога свежее N мс, иначе пара не считается
                                  # (bookTicker пушится на каждое изменение: в активном
@@ -95,6 +100,7 @@ class Engine:
         self.events: dict[tuple, Event] = {}               # (sym,buy,sell) -> Event
         self.banned: set[tuple] = set()                    # (sym, exA, exB) карантин
         self.conn_last: dict[str, int] = {}                # exch -> ms последнего сообщения
+        self.feed_lag: dict[str, float] = {}               # exch -> EWMA лага конвейера, мс
         # хуки форвард-слоя (не должны кидать исключения в горячий путь)
         self.on_event_open = None                          # (Event, buy_q, sell_q, loc)
         self.on_event_tick = None                          # (Event, buy_q, sell_q, loc)
@@ -114,6 +120,10 @@ class Engine:
     def on_quote(self, exch, sym, bid, bq, ask, aq, exch_ts):
         loc = now_ms()
         self.conn_last[exch] = loc
+        if exch_ts > 0:                                # лаг конвейера: EWMA по бирже
+            lag = loc - exch_ts                        # (клок-скью в минус -> считаем 0)
+            self.feed_lag[exch] = 0.8 * self.feed_lag.get(exch, 0.0) \
+                + 0.2 * (lag if lag > 0 else 0.0)
         q = self.books.setdefault(sym, {}).setdefault(exch, Quote())
         unchanged = (bid == q.bid and ask == q.ask)
         q.bid, q.bq, q.ask, q.aq, q.exch_ts, q.loc_ts = bid, bq, ask, aq, exch_ts, loc
@@ -131,6 +141,11 @@ class Engine:
                 continue                                   # фид встречной биржи болен
             if loc - oq.loc_ts > MAX_QUOTE_AGE_MS:
                 continue                                   # конкретная подписка молчит
+            if EXCH_STALE_MS > 0 and (
+                    self.feed_lag.get(exch, 0.0) > EXCH_STALE_MS
+                    or self.feed_lag.get(other, 0.0) > EXCH_STALE_MS):
+                continue                                   # бэклог конвейера: данные
+                                                           # протухли -> спред фантомный
             # направление 1: купить на exch (ask), продать на other (bid)
             self._check(sym, exch, other, q, oq, loc)
             # направление 2: купить на other, продать на exch

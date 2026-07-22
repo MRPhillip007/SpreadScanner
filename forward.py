@@ -162,6 +162,7 @@ class Forward:
         self.trades: dict[int, Trade] = {}                      # открытые/входящие
         self.cooldown: dict[tuple, int] = {}                    # (sym,exA,exB) -> until ms
         self.last_eval: dict[tuple, int] = {}
+        self.last_gross: dict[tuple, tuple] = {}                # (key) -> (ts, gross)
         self.day_pnl: dict[int, float] = {}
         self.pair_hist: dict[tuple, list] = {}                  # профиль связки: t_close событий
         self.by_sym: dict[str, list] = {}                       # sym -> [trade_id] открытых
@@ -224,8 +225,26 @@ class Forward:
         cap = min(bq.aq * bq.ask, sq.bq * sq.bid) * c["paper"]["top_book_frac"]
         if any(t.sym == ev.sym and t.status != "closed" for t in self.trades.values()):
             return                                              # уже в связке по символу
+        prev_g = self.last_gross.get(key)                       # траектория спреда
+        self.last_gross[key] = (loc, gross)
         if net * 100 < c["entry"]["net_min_pct"]:
             self._decide(loc, *key, gross, net, cap, "deny:net_below_min")
+            return
+        # ── CARRY-ГЕЙТ: фандинг должен быть попутным (carry >= 0) ──
+        # позиция long@buy_ex short@sell_ex платит f_buy и получает f_sell;
+        # спред без попутного carry = рынок закладывает риск, не неэффективность
+        if c["entry"].get("carry_gate", False):
+            carry = (-self.funding.get(ev.buy_ex, {}).get(ev.sym, 0.0)
+                     + self.funding.get(ev.sell_ex, {}).get(ev.sym, 0.0))
+            if carry < 0:
+                self._decide(loc, *key, gross, net, cap, "deny:carry_negative")
+                return
+        # ── MOMENTUM-ГАРД: спред ещё расширяется — дислокация в развитии, ──
+        # вход сейчас = ловля ножа (источник stop_widen); ждём стабилизации
+        mg = c["entry"].get("momentum_guard_pct", 0)
+        if (mg > 0 and prev_g is not None and loc - prev_g[0] <= 3000
+                and (gross - prev_g[1]) * 100 >= mg):
+            self._decide(loc, *key, gross, net, cap, "deny:momentum")
             return
         if loc < self.cooldown.get(key, 0) or loc < self.cooldown.get(
                 (ev.sym,) + tuple(sorted((ev.buy_ex, ev.sell_ex))), 0):
@@ -248,10 +267,23 @@ class Forward:
             if used + notional > c["risk"]["per_venue_exposure_usd"]:
                 self._decide(loc, *key, gross, net, cap, f"deny:venue_exposure:{ex}")
                 return
-        # ── выбор схемы по профилю связки ──
-        scheme = self._pick_scheme(ev.sym, ev.buy_ex, ev.sell_ex, loc)
+        # ── выбор схемы: сначала роли бирж, потом профиль связки ──
+        # «только-пассивные» биржи (тонкий стакан, промах IOC ~50%+, токсичный
+        # маркаут хеджа): агрессивные ордера туда не шлём — пассивная нога
+        # встаёт НА такой бирже, хедж тейкером на надёжной
+        po = set(self.cfg["maker"].get("passive_only_venues") or [])
+        mk_side = "buy"
+        if ev.buy_ex in po and ev.sell_ex in po:
+            self._decide(loc, *key, gross, net, cap, "deny:both_passive_only")
+            return                            # хеджировать негде — обе ноги тонкие
+        if ev.sell_ex in po:
+            scheme, mk_side = "maker", "sell"  # пассивная ПРОДАЖА на тонкой бирже
+        elif ev.buy_ex in po:
+            scheme, mk_side = "maker", "buy"   # пассивная покупка на тонкой бирже
+        else:
+            scheme = self._pick_scheme(ev.sym, ev.buy_ex, ev.sell_ex, loc)
         if scheme == "maker":
-            self._enter_maker(ev, bq, sq, loc, key, gross, cap, notional)
+            self._enter_maker(ev, bq, sq, loc, key, gross, cap, notional, mk_side)
             return
         # ── TAKER-TAKER: две IOC-ноги ──
         qty = notional / bq.ask
@@ -277,15 +309,22 @@ class Forward:
                      f"sell@{ev.sell_ex} {sq.bid:.6g} qty={qty:.4g} "
                      f"(${notional:.0f}, net {net*100:+.2f}%)")
 
-    # ---------- MAKER-FIRST: пассивная нога на дешёвой бирже ----------
-    def _enter_maker(self, ev, bq, sq, loc, key, gross, cap, notional):
+    # ---------- MAKER-FIRST: пассивная нога (buy на дешёвой / sell на дорогой) ----------
+    def _enter_maker(self, ev, bq, sq, loc, key, gross, cap, notional, mk_side="buy"):
         c = self.cfg["maker"]
-        P = bq.bid                                       # встаём в лучший бид (мейкер)
-        fee_cycle = (self.maker_fees.get(ev.buy_ex, 2e-4) + self.fees[ev.sell_ex]
+        if mk_side == "buy":
+            P = bq.bid                                   # встаём в лучший бид buy-биржи
+            mk_ex, hg_ex = ev.buy_ex, ev.sell_ex
+            exp_gross = sq.bid / P - 1.0                 # хедж: продать в бид sell-биржи
+        else:
+            P = sq.ask                                   # встаём в лучший аск sell-биржи
+            mk_ex, hg_ex = ev.sell_ex, ev.buy_ex
+            exp_gross = P / bq.ask - 1.0                 # хедж: купить по аску buy-биржи
+        fee_cycle = (self.maker_fees.get(mk_ex, 2e-4) + self.fees[hg_ex]
                      + self.fees[ev.buy_ex] + self.fees[ev.sell_ex])
         exit_cost = ((bq.ask - bq.bid) / bq.ask + (sq.ask - sq.bid) / sq.bid
                      + self.cfg["exit"]["converge_gross_pct"] / 100)
-        exp_net = sq.bid / P - 1.0 - fee_cycle - exit_cost
+        exp_net = exp_gross - fee_cycle - exit_cost
         if exp_net * 100 < c["net_min_pct"]:
             self._decide(loc, *key, gross, exp_net, cap, "deny:maker_net")
             return
@@ -304,13 +343,14 @@ class Forward:
         self.by_sym.setdefault(ev.sym, []).append(tid)
         self._decide(loc, *key, gross, exp_net, cap, "trade_maker", tid)
         self.n_orders += 1
-        ow = self.rtt.get(ev.buy_ex, self.cfg["latency"]["default_one_way_ms"])
-        o = POrder(self.n_orders, tid, "entry_maker", ev.buy_ex, ev.sym, "buy", "maker",
+        ow = self.rtt.get(mk_ex, self.cfg["latency"]["default_one_way_ms"])
+        o = POrder(self.n_orders, tid, "entry_maker", mk_ex, ev.sym, mk_side, "maker",
                    P, qty, P, loc, int(loc + ow))
         tr.entry_orders = [o]
         self.makers.setdefault(ev.sym, []).append(o)
-        self.eng.log(f"ВХОД[maker] #{tid} {ev.sym}: лимитка buy@{ev.buy_ex} {P:.6g} "
-                     f"(референс sell@{ev.sell_ex} {sq.bid:.6g}, ож.net {exp_net*100:+.2f}%)")
+        ref_px = sq.bid if mk_side == "buy" else bq.ask
+        self.eng.log(f"ВХОД[maker] #{tid} {ev.sym}: лимитка {mk_side}@{mk_ex} {P:.6g} "
+                     f"(референс хеджа @{hg_ex} {ref_px:.6g}, ож.net {exp_net*100:+.2f}%)")
 
     def _maker_tick(self, sym, loc):
         """Каждый тик символа: наливы/репрайсы/отмены пассивных заявок."""
@@ -327,31 +367,44 @@ class Forward:
                 continue
             book = self.eng.books.get(sym, {})
             bq, sq = book.get(tr.buy_ex), book.get(tr.sell_ex)
-            if not bq or not sq or bq.bid <= 0 or sq.bid <= 0:
+            if (not bq or not sq or bq.bid <= 0 or sq.bid <= 0
+                    or bq.ask <= 0 or sq.ask <= 0):
                 continue
             if o.leg != "entry_maker":                   # пассивные ВЫХОДНЫЕ лимитки
                 self._exit_maker_tick(o, tr, lst, book, loc)
                 continue
+            # своя книга (где стоит лимитка) и встречная (куда полетит хедж)
+            own = bq if o.venue == tr.buy_ex else sq
+            ref = sq if o.venue == tr.buy_ex else bq
+            hg_ex = tr.sell_ex if o.venue == tr.buy_ex else tr.buy_ex
             # 1) налив: цена прошла СКВОЗЬ наш уровень (строгое правило очереди)
-            if bq.ask < o.limit_px * (1 - 1e-12):
+            through = (own.ask < o.limit_px * (1 - 1e-12)) if o.side == "buy" \
+                else (own.bid > o.limit_px * (1 + 1e-12))
+            if through:
                 lst.remove(o)
                 o.status, o.fill_px, o.fill_qty = "filled", o.limit_px, o.qty
                 o.fee_usd = o.qty * o.limit_px * self.maker_fees.get(o.venue, 2e-4)
                 tr.fees += o.fee_usd
                 self.cash[o.venue] = self.cash.get(o.venue, 0.0) - o.fee_usd
                 self._order_row(o, loc)
-                h = self._submit(tr.trade_id, "entry_sell", tr.sell_ex, sym, "sell",
-                                 "taker", None, o.qty, sq.bid, loc)
-                tr.entry_orders = [o, h]
+                h_side = "sell" if o.side == "buy" else "buy"
+                h_dpx = ref.bid if h_side == "sell" else ref.ask
+                h = self._submit(tr.trade_id,
+                                 "entry_sell" if h_side == "sell" else "entry_buy",
+                                 hg_ex, sym, h_side, "taker", None, o.qty, h_dpx, loc)
+                # порядок всегда [buy-нога, sell-нога] — договор _finish_entry
+                tr.entry_orders = [o, h] if o.side == "buy" else [h, o]
                 tr.status = "entering"
                 self.mk_watch.append((loc + c["markout_s"] * 1000, tr.trade_id, sym,
-                                      tr.sell_ex, o.limit_px, sq.bid))
-                self.eng.log(f"НАЛИВ[maker] #{tr.trade_id} {sym} @{o.limit_px:.6g} — хеджирую")
+                                      hg_ex, o.limit_px, h_dpx, h_side))
+                self.eng.log(f"НАЛИВ[maker] #{tr.trade_id} {sym} {o.side} "
+                             f"@{o.limit_px:.6g} — хеджирую на {hg_ex}")
                 continue
             # 2) отмена: ожидаемый чистый упал ниже порога или TTL
-            fee_cycle = (self.maker_fees.get(tr.buy_ex, 2e-4) + self.fees[tr.sell_ex]
+            fee_cycle = (self.maker_fees.get(o.venue, 2e-4) + self.fees[hg_ex]
                          + self.fees[tr.buy_ex] + self.fees[tr.sell_ex])
-            exp_net = sq.bid / o.limit_px - 1.0 - fee_cycle
+            exp_net = (ref.bid / o.limit_px - 1.0 if o.side == "buy"
+                       else o.limit_px / ref.ask - 1.0) - fee_cycle
             if exp_net * 100 < c["cancel_net_pct"] or loc - o.created > c["ttl_s"] * 1000:
                 lst.remove(o)
                 o.status = "cancelled"
@@ -359,9 +412,10 @@ class Forward:
                 self._cancel_maker(tr, loc, "maker_cancel" if exp_net * 100
                                    < c["cancel_net_pct"] else "maker_ttl")
                 continue
-            # 3) репрайс: следуем за лучшим бидом (paper: очередь теряем, это ок)
-            if abs(bq.bid / o.limit_px - 1) > 2e-4:
-                o.limit_px = bq.bid
+            # 3) репрайс: следуем за своей стороной книги (paper: очередь теряем)
+            tgt = own.bid if o.side == "buy" else own.ask
+            if abs(tgt / o.limit_px - 1) > 2e-4:
+                o.limit_px = tgt
 
     def _exit_maker_tick(self, o: POrder, tr: Trade, lst, book, loc):
         """Пассивная закрывающая лимитка: налив по строгому проходу, репрайс за
@@ -518,7 +572,14 @@ class Forward:
                         self._resolve(o, q, loc)
             for tr in list(self.trades.values()):
                 if tr.status == "open":
-                    if loc - tr.t_open > self.cfg["exit"]["timeout_min"] * 60_000:
+                    # попутный carry СЕЙЧАС -> расширяем бюджет удержания:
+                    # позиция зарабатывает фандинг, ожидание платит нам
+                    to = self.cfg["exit"]["timeout_min"] * 60_000
+                    carry_now = (-self.funding.get(tr.buy_ex, {}).get(tr.sym, 0.0)
+                                 + self.funding.get(tr.sell_ex, {}).get(tr.sym, 0.0))
+                    if carry_now > 0:
+                        to *= self.cfg["exit"].get("funding_extend_mult", 1)
+                    if loc - tr.t_open > to:
                         self._start_exit(tr, loc, "timeout", style="maker")
                     else:
                         self._accrue_funding(tr, loc)
@@ -532,12 +593,16 @@ class Forward:
             due = [m for m in self.mk_watch if m[0] <= loc]     # маркауты
             for m in due:
                 self.mk_watch.remove(m)
-                _, tid, sym, venue, fill_px, ref0 = m
+                _, tid, sym, venue, fill_px, ref0, h_side = m
                 q = self.eng.books.get(sym, {}).get(venue)
-                if q and q.bid > 0 and ref0 > 0:
+                if q and q.bid > 0 and q.ask > 0 and ref0 > 0:
+                    # нормировка знака: ОТРИЦАТЕЛЬНЫЙ маркаут = adverse для хеджа
+                    now_px = q.bid if h_side == "sell" else q.ask
+                    mo = (now_px / ref0 - 1) if h_side == "sell" \
+                        else (ref0 / now_px - 1)
                     self.store.q("INSERT INTO markouts VALUES(?,?,?,?,?,?,?,?)",
-                                 (loc, tid, sym, venue, fill_px, ref0, q.bid,
-                                  (q.bid / ref0 - 1) * 1e4))
+                                 (loc, tid, sym, venue, fill_px, ref0, now_px,
+                                  mo * 1e4))
 
     # ---------- завершение входа ----------
     def _finish_entry(self, tr: Trade, loc):
