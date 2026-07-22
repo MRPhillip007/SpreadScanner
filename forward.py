@@ -419,23 +419,29 @@ class Forward:
 
     def _exit_maker_tick(self, o: POrder, tr: Trade, lst, book, loc):
         """Пассивная закрывающая лимитка: налив по строгому проходу, репрайс за
-        своей стороной, эскалация в тейкер по passive_ttl или при уходе к стопу."""
+        своей стороной С ПОЛОМ преследования, эскалации (стоп / TTL).
+        Последовательный режим (нога одна): налив -> мгновенный тейкер-хедж."""
         q = book.get(o.venue)
-        if not q or q.bid <= 0:
+        if not q or q.bid <= 0 or q.ask <= 0:
             return
+        c = self.cfg["exit"]
+        seq = c.get("sequential", False) and len(tr.exit_orders) == 1
         # спред разошёлся к стопу во время пассивного выхода -> срочность настоящая
         bq2, sq2 = book.get(tr.buy_ex), book.get(tr.sell_ex)
         if bq2 and sq2 and bq2.ask > 0 and sq2.bid > 0:
             gross_now = sq2.bid / bq2.ask - 1.0
-            if (gross_now - tr.theor_gross) * 100 >= self.cfg["exit"]["stop_widen_pct"]:
+            if (gross_now - tr.theor_gross) * 100 >= c["stop_widen_pct"]:
                 lst.remove(o)
                 o.status = "cancelled"
                 self._order_row(o, loc)
-                dpx = q.bid if o.side == "sell" else q.ask
-                t = self._submit(tr.trade_id, o.leg, o.venue, o.sym, o.side, "taker",
-                                 None, o.qty, dpx, loc)
-                tr.exit_orders = [t if x is o else x for x in tr.exit_orders]
                 tr.exit_reason = "stop_widen"
+                if seq:                                  # второй ноги ещё нет — обе тейкером
+                    self._fire_both_takers(tr, book, loc)
+                else:
+                    dpx = q.bid if o.side == "sell" else q.ask
+                    t = self._submit(tr.trade_id, o.leg, o.venue, o.sym, o.side,
+                                     "taker", None, o.qty, dpx, loc)
+                    tr.exit_orders = [t if x is o else x for x in tr.exit_orders]
                 self.eng.log(f"ЭСКАЛАЦИЯ-СТОП #{tr.trade_id} {o.sym} {o.leg}: "
                              f"спред разошёлся во время пассивного выхода — тейкер")
                 return
@@ -448,23 +454,100 @@ class Forward:
             tr.fees += o.fee_usd
             self.cash[o.venue] = self.cash.get(o.venue, 0.0) - o.fee_usd
             self._order_row(o, loc)
+            if seq:
+                # налив пассива -> МГНОВЕННО добиваем вторую ногу тейкером:
+                # голое направленное окно = один перелёт вместо минут
+                if o.venue == tr.buy_ex:
+                    oq = book.get(tr.sell_ex)
+                    dpx = oq.ask if oq and oq.ask > 0 else tr.sell_fill
+                    h = self._submit(tr.trade_id, "exit_sell", tr.sell_ex, tr.sym,
+                                     "buy", "taker", None, o.qty, dpx, loc)
+                else:
+                    oq = book.get(tr.buy_ex)
+                    dpx = oq.bid if oq and oq.bid > 0 else tr.buy_fill
+                    h = self._submit(tr.trade_id, "exit_buy", tr.buy_ex, tr.sym,
+                                     "sell", "taker", None, o.qty, dpx, loc)
+                tr.exit_orders.append(h)
+                self.eng.log(f"НАЛИВ-ВЫХОД[seq] #{tr.trade_id} {tr.sym} {o.side}@"
+                             f"{o.venue} {o.limit_px:.6g} — добиваю вторую тейкером")
+                return
             if all(x.status != "pending" for x in tr.exit_orders):
                 self._finish_exit(tr, loc)
             return
-        if loc - o.created > self.cfg["exit"]["passive_ttl_min"] * 60_000:
+        # TTL: в последовательном режиме позиция захеджирована — ждём долго
+        ttl_min = c.get("seq_ttl_min", 180) if seq else c["passive_ttl_min"]
+        if loc - o.created > ttl_min * 60_000:
             lst.remove(o)                                # эскалация в тейкер
             o.status = "cancelled"
             self._order_row(o, loc)
-            dpx = q.bid if o.side == "sell" else q.ask
-            t = self._submit(tr.trade_id, o.leg, o.venue, o.sym, o.side, "taker",
-                             None, o.qty, dpx, loc)
-            tr.exit_orders = [t if x is o else x for x in tr.exit_orders]
+            if seq:
+                self._fire_both_takers(tr, book, loc)
+            else:
+                dpx = q.bid if o.side == "sell" else q.ask
+                t = self._submit(tr.trade_id, o.leg, o.venue, o.sym, o.side, "taker",
+                                 None, o.qty, dpx, loc)
+                tr.exit_orders = [t if x is o else x for x in tr.exit_orders]
             self.eng.log(f"ЭСКАЛАЦИЯ #{tr.trade_id} {o.sym} {o.leg}: "
-                         f"пассивный выход не налился {self.cfg['exit']['passive_ttl_min']}м — тейкер")
+                         f"пассивный выход не налился {ttl_min}м — тейкер")
             return
         target = q.ask if o.side == "sell" else q.bid    # держимся у своей стороны
+        if seq:
+            target = self._chase_clamp(tr, o, book, target)
         if abs(target / o.limit_px - 1) > 2e-4:
             o.limit_px = target
+
+    def _chase_clamp(self, tr: Trade, o: POrder, book, target):
+        """ПОЛ ПРЕСЛЕДОВАНИЯ. Погоня за уходящей ценой без пола гарантированно
+        встречает рынок в худшей точке отката (замерено: -10.3 б.п. на ногу).
+        Лимитка следует за рынком не дальше chase_max_bps от цены постановки
+        и никогда — за уровень безубытка сделки, когда тот был достижим.
+        В выгодную сторону репрайс свободен."""
+        cap = self.cfg["exit"].get("chase_max_bps", -1)
+        if cap < 0:
+            return target                               # пол выключен
+        be = self._seq_be_px(tr, o, book)
+        if o.side == "sell":
+            floor = o.decision_px * (1 - cap / 1e4)
+            if be is not None and be <= o.decision_px:  # безубыток достижим
+                floor = max(floor, be)
+            return max(target, floor)
+        ceil_ = o.decision_px * (1 + cap / 1e4)
+        if be is not None and be >= o.decision_px:
+            ceil_ = min(ceil_, be)
+        return min(target, ceil_)
+
+    def _seq_be_px(self, tr: Trade, o: POrder, book):
+        """Цена пассивной ноги, при которой ПОЛНЫЙ PnL сделки = 0, если вторую
+        ногу закрыть тейкером по текущей книге встречной биржи. None — книга
+        встречной стороны непригодна для оценки."""
+        if tr.qty <= 0:
+            return None
+        mf = self.maker_fees.get(o.venue, 2e-4)
+        sunk = (tr.fees + tr.trim - tr.funding) / tr.qty
+        if o.venue == tr.buy_ex:                        # продаём лонг, хедж buy@sell_ex
+            oq = book.get(tr.sell_ex)
+            if not oq or oq.ask <= 0:
+                return None
+            h, tf = oq.ask, self.fees[tr.sell_ex]
+            return (sunk + tr.buy_fill - tr.sell_fill + h * (1 + tf)) / (1 - mf)
+        oq = book.get(tr.buy_ex)                        # откупаем шорт, хедж sell@buy_ex
+        if not oq or oq.bid <= 0:
+            return None
+        h, tf = oq.bid, self.fees[tr.buy_ex]
+        return (tr.sell_fill - tr.buy_fill + h * (1 - tf) - sunk) / (1 + mf)
+
+    def _fire_both_takers(self, tr: Trade, book, loc):
+        """Экстренное закрытие обеих ног тейкерами (эскалация последовательного
+        выхода: стоп или TTL — вторая пассивная нога ещё не существовала)."""
+        bq, sq = book.get(tr.buy_ex), book.get(tr.sell_ex)
+        dpx_b = bq.bid if bq and bq.bid > 0 else tr.buy_fill
+        dpx_s = sq.ask if sq and sq.ask > 0 else tr.sell_fill
+        tr.exit_orders = [
+            self._submit(tr.trade_id, "exit_buy", tr.buy_ex, tr.sym, "sell", "taker",
+                         None, tr.qty, dpx_b, loc),
+            self._submit(tr.trade_id, "exit_sell", tr.sell_ex, tr.sym, "buy", "taker",
+                         None, tr.qty, dpx_s, loc),
+        ]
 
     def _cancel_maker(self, tr: Trade, loc, reason):
         self.store.q("UPDATE trades SET t_close=?, status='closed', exit_reason=?, "
@@ -588,6 +671,12 @@ class Forward:
                         if (tr.funding < 0 and budget > 0
                                 and -tr.funding > self.cfg["exit"]["funding_eat_frac"] * budget):
                             self._start_exit(tr, loc, "funding_bleed", style="maker")
+                elif (tr.status == "exiting" and tr.exit_orders
+                        and not any(x.fill_qty > 0 for x in tr.exit_orders)):
+                    # обе ноги ещё стоят на биржах (пассивный выход ждёт налива) —
+                    # фандинг продолжает начисляться; существенно для
+                    # последовательного выхода, где ожидание может длиться часами
+                    self._accrue_funding(tr, loc)
             for sym in list(self.makers):                       # TTL в тихих стаканах
                 self._maker_tick(sym, loc)
             due = [m for m in self.mk_watch if m[0] <= loc]     # маркауты
@@ -699,8 +788,33 @@ class Forward:
         book = self.eng.books.get(tr.sym, {})
         bq, sq = book.get(tr.buy_ex), book.get(tr.sell_ex)
         if style == "maker" and bq and sq and bq.ask > 0 and sq.bid > 0:
-            # пассивный выход: продаём лонг лимиткой в аск своей биржи,
-            # откупаем шорт лимиткой в бид своей — экономим внутренние спреды
+            if self.cfg["exit"].get("sequential", False):
+                # ПОСЛЕДОВАТЕЛЬНЫЙ ВЫХОД: одна пассивная нога; вторая закрывается
+                # мгновенным тейкером ПОСЛЕ её налива. Пока пассив ждёт, позиция
+                # полностью захеджирована — голое окно между ногами (p90 было
+                # 8.3 мин) схлопывается до одного сетевого перелёта.
+                # Пассив — на passive-only бирже (агрессию туда не шлём), иначе
+                # там, где внутренний спред шире: экономия пассивности больше,
+                # а хедж на узкой бирже дешевле.
+                po = set(self.cfg["maker"].get("passive_only_venues") or [])
+                if (tr.buy_ex in po) != (tr.sell_ex in po):
+                    pv = tr.buy_ex if tr.buy_ex in po else tr.sell_ex
+                else:
+                    rel_b = (bq.ask - bq.bid) / bq.ask
+                    rel_s = (sq.ask - sq.bid) / sq.bid
+                    pv = tr.buy_ex if rel_b >= rel_s else tr.sell_ex
+                if pv == tr.buy_ex:
+                    o1 = self._mk_order(tr.trade_id, "exit_buy", tr.buy_ex, tr.sym,
+                                        "sell", bq.ask, tr.qty, loc)
+                else:
+                    o1 = self._mk_order(tr.trade_id, "exit_sell", tr.sell_ex, tr.sym,
+                                        "buy", sq.bid, tr.qty, loc)
+                tr.exit_orders = [o1]
+                self.eng.log(f"ВЫХОД[seq] #{tr.trade_id} {tr.sym} [{reason}]: пассив "
+                             f"{o1.side}@{o1.venue} {o1.limit_px:.6g}, хедж тейкером "
+                             f"после налива")
+                return
+            # одновременный пассивный выход: обе ноги лимитками (легаси-режим)
             o1 = self._mk_order(tr.trade_id, "exit_buy", tr.buy_ex, tr.sym, "sell",
                                 bq.ask, tr.qty, loc)
             o2 = self._mk_order(tr.trade_id, "exit_sell", tr.sell_ex, tr.sym, "buy",
