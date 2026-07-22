@@ -65,6 +65,14 @@ V = {
         sub={"op": "subscribe", "args": [{"instType": "USDT-FUTURES",
                                           "channel": "books1", "instId": "BTCUSDT"}]},
         ts=lambda j: float(j["data"][0]["ts"]) if j.get("data") else 0),
+    # КАНДИДАТ на подключение: Aster (перп-DEX). API — клон Binance fapi,
+    # поэтому конфиг отличается только хостом. Мерим ДО написания коннектора:
+    # если задержка из Токио большая — площадка в лучшем случае пассивная.
+    "aster": dict(
+        time="https://fapi.asterdex.com/fapi/v1/time",
+        t=lambda j: float(j["serverTime"]),
+        ws="wss://fstream.asterdex.com/ws/btcusdt@bookTicker", sub=None,
+        ts=lambda j: float(j.get("T") or j.get("E") or 0)),
 }
 
 
@@ -126,7 +134,10 @@ async def bench_one(name, cfg, session):
                     if skipped < 5:                    # снапшотный залп после подписки
                         skipped += 1
                         continue
-                    lags.append(loc - ts - out["clock_off"])
+                    # clock_off = часы_биржи − часы_сервера; переводим локальное
+                    # время получения в часы биржи, поэтому ПЛЮС (был неверный знак:
+                    # на машине с расхождением часов лаг выходил отрицательным)
+                    lags.append(loc + out["clock_off"] - ts)
             if lags:
                 out["ws_n"] = len(lags)
                 out["ws_lag_med"] = pct(lags, 50)
