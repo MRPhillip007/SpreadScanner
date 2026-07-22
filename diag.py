@@ -24,6 +24,35 @@ if not len(tr):
 hrs = (tr.t_close.max() - tr.t_open.min()) / 3.6e6
 print(f"закрытых записей: {len(tr)} за {hrs:.1f}ч, PnL ИТОГО: {tr.pnl_usd.sum():+.2f}$")
 
+# ── фильтр контаминации: сделки, входившие при ОТСТАВАНИИ фида (фантомы) ──
+# feeds.lag_ms пишется каждые 30с; если на входе лаг ноги > порога — котировка
+# была протухшей, спред фантомный. Дальнейшие разрезы — только по чистым.
+LAG_BAD_MS = int(os.environ.get("LAG_BAD_MS", "2000"))
+fe = pd.read_sql("SELECT ts, venue, lag_ms FROM feeds WHERE ts>=?", db,
+                 params=(int(run.ts),)).sort_values("ts")
+if len(fe):
+    tr = tr.sort_values("t_open", kind="stable").reset_index(drop=True)
+    for col in ("buy_ex", "sell_ex"):
+        lagv = tr[["t_open", col]].rename(columns={col: "venue"})
+        m = pd.merge_asof(lagv, fe.rename(columns={"ts": "fts"}),
+                          left_on="t_open", right_on="fts", by="venue",
+                          direction="nearest", tolerance=90_000)
+        tr[col + "_lag"] = m["lag_ms"].to_numpy()
+    tr["contam"] = ((tr.buy_ex_lag.fillna(0) > LAG_BAD_MS)
+                    | (tr.sell_ex_lag.fillna(0) > LAG_BAD_MS))
+    bad, clean = tr[tr.contam], tr[~tr.contam]
+    print(f"\n── ФИЛЬТР КОНТАМИНАЦИИ (лаг фида > {LAG_BAD_MS} мс на входе) ──")
+    print(f"загрязнённых сделок: {len(bad)} из {len(tr)} "
+          f"({len(bad)/len(tr)*100:.0f}%), их PnL {bad.pnl_usd.sum():+.2f}$")
+    print(f"ЧИСТЫЙ PnL: {clean.pnl_usd.sum():+.2f}$ на {len(clean)} сделках")
+    badf = fe[fe.lag_ms > LAG_BAD_MS]
+    if len(badf):
+        sp = pd.to_datetime(badf.ts, unit="ms", utc=True)
+        print(f"окна отставания: {sp.min():%m-%d %H:%M}..{sp.max():%H:%M} UTC "
+              f"({len(badf)} снапшотов; худший лаг {badf.lag_ms.max()/1000:.0f}с)")
+    tr = clean.copy()
+    print(f"(дальнейшие разрезы — ТОЛЬКО чистые {len(tr)} сделок)")
+
 print("\n── схема × исход ──")
 g = tr.groupby(["scheme", "exit_reason"]).agg(
     n=("trade_id", "size"), pnl=("pnl_usd", "sum"), avg=("pnl_usd", "mean"),
