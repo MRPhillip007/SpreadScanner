@@ -430,7 +430,8 @@ class Forward:
         bq2, sq2 = book.get(tr.buy_ex), book.get(tr.sell_ex)
         if bq2 and sq2 and bq2.ask > 0 and sq2.bid > 0:
             gross_now = sq2.bid / bq2.ask - 1.0
-            if (gross_now - tr.theor_gross) * 100 >= c["stop_widen_pct"]:
+            sw = c["stop_widen_pct"]
+            if sw > 0 and (gross_now - tr.theor_gross) * 100 >= sw:
                 lst.remove(o)
                 o.status = "cancelled"
                 self._order_row(o, loc)
@@ -766,7 +767,8 @@ class Forward:
             if not bq or not sq or bq.ask <= 0 or sq.bid <= 0:
                 continue
             gross_now = sq.bid / bq.ask - 1.0
-            if (gross_now - tr.theor_gross) * 100 >= c["stop_widen_pct"]:
+            if (c["stop_widen_pct"] > 0
+                    and (gross_now - tr.theor_gross) * 100 >= c["stop_widen_pct"]):
                 self._start_exit(tr, loc, "stop_widen", style="taker")   # риск — немедленно
                 continue
             # E2: схождение засчитывается, если держится confirm_ms подряд
