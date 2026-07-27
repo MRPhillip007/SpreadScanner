@@ -3,8 +3,10 @@
 Запуск: python web.py  ->  http://127.0.0.1:8100"""
 from __future__ import annotations
 
+import functools
 import os
 import sqlite3
+import time
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -12,6 +14,28 @@ from fastapi.responses import HTMLResponse
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DB = os.path.join(ROOT, "data", "forward.db")
 app = FastAPI(title="Spread Forward")
+
+_cache: dict = {}
+
+
+def cached(ttl_s: float):
+    """Кэш ответа на ttl_s секунд. База растёт (3.7М решений / 508 МБ за четверо
+    суток), и пересчёт агрегатов на каждый опрос браузера — это часы CPU в сутки,
+    отнятые у бота на двухъядерной машине (ровно тот механизм, что раньше давал
+    отставание фида и фантомные сделки)."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrap(*a, **kw):
+            key = (fn.__name__, a, tuple(sorted(kw.items())))
+            now = time.time()
+            hit = _cache.get(key)
+            if hit is not None and now - hit[0] < ttl_s:
+                return hit[1]
+            val = fn(*a, **kw)
+            _cache[key] = (now, val)
+            return val
+        return wrap
+    return deco
 
 
 def q(sql, args=()):
@@ -32,59 +56,86 @@ def q(sql, args=()):
 EMPTY_TR = dict(n=0, pnl=0, avg_pnl=0, wins=0, fees=0, slip=0, funding=0, avg_hold_s=0)
 
 
+def cur_run():
+    """Текущая эпоха. Все сводки считаются по ней, а не по всей истории базы:
+    эпоха = версия конфига, смешивать разные версии в одних цифрах бессмысленно
+    (и именно полный проход по истории жёг процессор)."""
+    r = q("SELECT run_id, ts, cfg_hash FROM config_runs ORDER BY ts DESC LIMIT 1")
+    return r[0] if r else dict(run_id="", ts=0, cfg_hash="")
+
+
 @app.get("/api/summary")
+@cached(12)
 def summary():
     if not os.path.exists(DB):
         return dict(equity=[], trades=EMPTY_TR, no_fill=0, leg_risk=0, decisions=[],
                     exit_reasons=[], note="БД не найдена — сначала запусти forward.py")
-    eq = q("""SELECT venue, cash FROM equity e WHERE ts =
-              (SELECT MAX(ts) FROM equity WHERE venue = e.venue)""")
+    run = cur_run()
+    rid, rts = run["run_id"], run["ts"]
+    eq = q("""SELECT venue, cash FROM (SELECT venue, cash,
+                ROW_NUMBER() OVER (PARTITION BY venue ORDER BY ts DESC) rn
+                FROM equity WHERE ts >= ?) WHERE rn = 1""", (rts,))
     tr_rows = q("""SELECT COUNT(*) n, COALESCE(SUM(pnl_usd),0) pnl,
               COALESCE(AVG(pnl_usd),0) avg_pnl,
               SUM(CASE WHEN pnl_usd>0 THEN 1 ELSE 0 END) wins,
               COALESCE(SUM(fees_usd),0) fees, COALESCE(SUM(entry_slip_usd+exit_slip_usd),0) slip,
               COALESCE(SUM(funding_usd),0) funding, COALESCE(AVG(hold_ms)/1000.0,0) avg_hold_s
-              FROM trades WHERE status='closed' AND exit_reason NOT IN ('no_fill')""")
+              FROM trades WHERE run=? AND status='closed'
+                AND exit_reason NOT IN ('no_fill','maker_cancel','maker_ttl')""", (rid,))
     tr = tr_rows[0] if tr_rows else EMPTY_TR
     if tr.get("wins") is None:
         tr["wins"] = 0
-    nf = q("SELECT COUNT(*) n FROM trades WHERE exit_reason='no_fill'")
+    nf = q("SELECT COUNT(*) n FROM trades WHERE run=? AND exit_reason='no_fill'", (rid,))
     nofill = nf[0]["n"] if nf else 0
-    lg = q("SELECT COUNT(*) n FROM incidents WHERE kind='leg_risk'")
+    lg = q("SELECT COUNT(*) n FROM incidents WHERE kind='leg_risk' AND ts>=?", (rts,))
     legr = lg[0]["n"] if lg else 0
-    dec = q("""SELECT action, COUNT(*) n FROM decisions GROUP BY action ORDER BY n DESC""")
+    dec = q("""SELECT action, COUNT(*) n FROM decisions WHERE run=?
+               GROUP BY action ORDER BY n DESC""", (rid,))
     reasons = q("""SELECT exit_reason, COUNT(*) n, COALESCE(SUM(pnl_usd),0) pnl
-                   FROM trades WHERE status='closed' GROUP BY exit_reason""")
-    return dict(equity=eq, trades=tr, no_fill=nofill, leg_risk=legr,
-                decisions=dec, exit_reasons=reasons)
+                   FROM trades WHERE run=? AND status='closed'
+                   GROUP BY exit_reason ORDER BY pnl""", (rid,))
+    return dict(equity=eq, trades=tr, no_fill=nofill, leg_risk=legr, decisions=dec,
+                exit_reasons=reasons, epoch=run["run_id"], cfg=run["cfg_hash"][:8])
 
 
 @app.get("/api/positions")
+@cached(4)
 def positions():
     return q("""SELECT trade_id, scheme, sym, buy_ex, sell_ex, t_open, status,
                 notional_usd, theor_net_pct FROM trades
-                WHERE status != 'closed' ORDER BY t_open DESC LIMIT 50""")
+                WHERE status NOT IN ('closed') ORDER BY t_open DESC LIMIT 50""")
 
 
 @app.get("/api/trades")
+@cached(10)
 def trades(limit: int = 100):
     return q("""SELECT trade_id, scheme, sym, buy_ex, sell_ex, t_open, t_close, qty,
                 notional_usd, theor_net_pct, pnl_usd, entry_slip_usd, exit_slip_usd,
                 fees_usd, funding_usd, exit_reason, hold_ms
-                FROM trades WHERE status='closed' ORDER BY t_close DESC LIMIT ?""", (limit,))
+                FROM trades WHERE status='closed'
+                  AND exit_reason NOT IN ('maker_cancel','maker_ttl')
+                ORDER BY t_close DESC LIMIT ?""", (limit,))
 
 
 @app.get("/api/decisions")
+@cached(10)
 def decisions(limit: int = 200):
+    # ix_dec_ts делает это мгновенным; без LIMIT по индексу был бы полный проход
     return q("SELECT * FROM decisions ORDER BY ts DESC LIMIT ?", (limit,))
 
 
 @app.get("/api/health")
+@cached(12)
 def health():
-    feeds = q("""SELECT venue, rate, lag_ms, ts FROM feeds f WHERE ts =
-                 (SELECT MAX(ts) FROM feeds WHERE venue = f.venue)""")
-    rtt = q("""SELECT venue, rtt_ms, ts FROM venue_rtt r WHERE ts =
-               (SELECT MAX(ts) FROM venue_rtt WHERE venue = r.venue)""")
+    # оконная функция вместо коррелированного подзапроса: тот перебирал
+    # всю таблицу для КАЖДОЙ строки (feeds пишется раз в 30с — за сутки тысячи строк)
+    since = cur_run()["ts"]
+    feeds = q("""SELECT venue, rate, lag_ms, ts FROM (SELECT venue, rate, lag_ms, ts,
+                 ROW_NUMBER() OVER (PARTITION BY venue ORDER BY ts DESC) rn
+                 FROM feeds WHERE ts >= ?) WHERE rn = 1""", (since,))
+    rtt = q("""SELECT venue, rtt_ms, ts FROM (SELECT venue, rtt_ms, ts,
+               ROW_NUMBER() OVER (PARTITION BY venue ORDER BY ts DESC) rn
+               FROM venue_rtt WHERE ts >= ?) WHERE rn = 1""", (since,))
     runs = q("SELECT * FROM config_runs ORDER BY ts DESC LIMIT 5")
     return dict(feeds=feeds, rtt=rtt, runs=runs)
 
@@ -114,6 +165,8 @@ async function tick(){
  let eqsum=s.equity.reduce((a,x)=>a+x.cash,0);
  document.getElementById('cards').innerHTML=
   (s.note?`<div class=card style="border-color:#b8860b">⚠ ${s.note}</div>`:'')+
+  `<div class=card>Эпоха <b>${s.cfg||'—'}</b><br><span class=muted>${
+     s.epoch||''}<br>цифры ниже — только по ней</span></div>`+
   `<div class=card>Эквити <b>$${eqsum.toFixed(2)}</b><br><span class=muted>${
      s.equity.map(x=>x.venue+' $'+x.cash.toFixed(0)).join(' · ')}</span></div>`+
   `<div class=card>Сделок <b>${s.trades.n}</b><br><span class=muted>WR ${
@@ -153,7 +206,8 @@ async function tick(){
    return `<tr><td>${x.venue}</td><td>${x.rate.toFixed(0)}</td><td>${x.lag_ms.toFixed(0)}</td>
     <td>${r.rtt_ms?r.rtt_ms.toFixed(0):'—'}</td></tr>`}).join('');
 }
-tick(); setInterval(tick, 3000);
+tick(); setInterval(tick, 8000);   // 3с -> 8с: на двух ядрах опрос конкурирует
+                                   // с ботом за CPU, а данные так часто не меняются
 </script>"""
 
 

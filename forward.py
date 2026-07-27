@@ -81,6 +81,12 @@ class FStore:
         CREATE TABLE IF NOT EXISTS feeds(ts INT, venue TEXT, rate REAL, lag_ms REAL);
         CREATE INDEX IF NOT EXISTS ix_dec_ts ON decisions(ts);
         CREATE INDEX IF NOT EXISTS ix_tr_ts ON trades(t_open);
+        -- покрывающий индекс под воронку дашборда: без него GROUP BY action шёл
+        -- полным сканом (3.7М строк каждые 3с = 16ч CPU за четверо суток)
+        CREATE INDEX IF NOT EXISTS ix_dec_run_act ON decisions(run, action);
+        CREATE INDEX IF NOT EXISTS ix_tr_run ON trades(run, status);
+        CREATE INDEX IF NOT EXISTS ix_feeds_ts ON feeds(ts);
+        CREATE INDEX IF NOT EXISTS ix_eq_ts ON equity(ts);
         """)
         try:
             self.db.execute("ALTER TABLE trades ADD COLUMN scheme TEXT DEFAULT 'taker'")
