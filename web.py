@@ -81,7 +81,8 @@ def summary():
               COALESCE(SUM(fees_usd),0) fees, COALESCE(SUM(entry_slip_usd+exit_slip_usd),0) slip,
               COALESCE(SUM(funding_usd),0) funding, COALESCE(AVG(hold_ms)/1000.0,0) avg_hold_s
               FROM trades WHERE run=? AND status='closed'
-                AND exit_reason NOT IN ('no_fill','maker_cancel','maker_ttl')""", (rid,))
+                AND exit_reason NOT IN ('no_fill','maker_cancel','maker_ttl',
+                                        'orphaned')""", (rid,))
     tr = tr_rows[0] if tr_rows else EMPTY_TR
     if tr.get("wins") is None:
         tr["wins"] = 0
@@ -93,6 +94,7 @@ def summary():
                GROUP BY action ORDER BY n DESC""", (rid,))
     reasons = q("""SELECT exit_reason, COUNT(*) n, COALESCE(SUM(pnl_usd),0) pnl
                    FROM trades WHERE run=? AND status='closed'
+                     AND exit_reason NOT IN ('orphaned')
                    GROUP BY exit_reason ORDER BY pnl""", (rid,))
     return dict(equity=eq, trades=tr, no_fill=nofill, leg_risk=legr, decisions=dec,
                 exit_reasons=reasons, epoch=run["run_id"], cfg=run["cfg_hash"][:8])

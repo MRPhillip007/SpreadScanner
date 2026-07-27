@@ -997,6 +997,16 @@ async def main():
         eng = SC.Engine(fees, verbose_events=False)
         sc_store = SC.Store()                          # слой-1: события/снапшоты/фандинг
         store = FStore()
+        # ОСИРОТЕВШИЕ ПОЗИЦИИ: бумажный брокер живёт в памяти, поэтому после
+        # рестарта незакрытые сделки прошлых запусков остались бы в базе со
+        # статусом open навсегда и вечно висели бы в дашборде. Помечаем их
+        # честно: исход неизвестен, PnL не приписываем (в разрезах отдельная
+        # строка orphaned, статистику закрытых сделок она не искажает)
+        orph = store.q("UPDATE trades SET status='closed', exit_reason='orphaned', "
+                       "t_close=?, pnl_usd=0 WHERE status!='closed'", (now_ms(),))
+        if orph.rowcount > 0:
+            print(f"осиротевших позиций прошлых запусков закрыто: {orph.rowcount}",
+                  flush=True)
         store.q("INSERT INTO config_runs VALUES(?,?,?,?)",
                 (run_id, now_ms(), cfg_hash, cfg_json))
         fwd = Forward(cfg, eng, store, fees, run_id)
