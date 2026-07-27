@@ -230,13 +230,15 @@ class Forward:
         if net * 100 < c["entry"]["net_min_pct"]:
             self._decide(loc, *key, gross, net, cap, "deny:net_below_min")
             return
-        # ── CARRY-ГЕЙТ: фандинг должен быть попутным (carry >= 0) ──
-        # позиция long@buy_ex short@sell_ex платит f_buy и получает f_sell;
-        # спред без попутного carry = рынок закладывает риск, не неэффективность
+        # ── CARRY-ГЕЙТ: фандинг не должен быть заметно встречным ──
+        # позиция long@buy_ex short@sell_ex платит f_buy и получает f_sell.
+        # Порог, а не жёсткий ноль: холд медианно 12 мин, до выплаты доживают ~10%
+        # позиций, поэтому мелкий отрицательный carry — шум, а не риск; жёсткий
+        # ноль отвергал 237k решений, у которых спреды были ЛУЧШЕ взятых
         if c["entry"].get("carry_gate", False):
             carry = (-self.funding.get(ev.buy_ex, {}).get(ev.sym, 0.0)
                      + self.funding.get(ev.sell_ex, {}).get(ev.sym, 0.0))
-            if carry < 0:
+            if carry < c["entry"].get("min_carry", 0.0):
                 self._decide(loc, *key, gross, net, cap, "deny:carry_negative")
                 return
         # ── MOMENTUM-ГАРД: спред ещё расширяется — дислокация в развитии, ──
@@ -282,6 +284,12 @@ class Forward:
             scheme, mk_side = "maker", "buy"   # пассивная покупка на тонкой бирже
         else:
             scheme = self._pick_scheme(ev.sym, ev.buy_ex, ev.sell_ex, loc)
+            # обе биржи «нормальные»: пассив туда, где внутренний спред ШИРЕ —
+            # там мейкер зарабатывает больше, а хедж на узкой бирже дешевле
+            if (scheme == "maker"
+                    and self.cfg["maker"].get("passive_side", "buy") == "auto"
+                    and (sq.ask - sq.bid) / sq.bid > (bq.ask - bq.bid) / bq.ask):
+                mk_side = "sell"
         if scheme == "maker":
             self._enter_maker(ev, bq, sq, loc, key, gross, cap, notional, mk_side)
             return
@@ -400,11 +408,17 @@ class Forward:
                 self.eng.log(f"НАЛИВ[maker] #{tr.trade_id} {sym} {o.side} "
                              f"@{o.limit_px:.6g} — хеджирую на {hg_ex}")
                 continue
-            # 2) отмена: ожидаемый чистый упал ниже порога или TTL
+            # 2) отмена: ожидаемый чистый упал ниже порога или TTL.
+            # Считаем ПОЛНЫЙ цикл — той же формулой, что и на входе (включая
+            # стоимость выхода). Раньше вход требовал 0.15% ПОСЛЕ выходных издержек,
+            # а отмена срабатывала при 0% БЕЗ них: заявка доживала до заведомо
+            # убыточного плана и там наливалась
             fee_cycle = (self.maker_fees.get(o.venue, 2e-4) + self.fees[hg_ex]
                          + self.fees[tr.buy_ex] + self.fees[tr.sell_ex])
+            exit_cost = ((bq.ask - bq.bid) / bq.ask + (sq.ask - sq.bid) / sq.bid
+                         + self.cfg["exit"]["converge_gross_pct"] / 100)
             exp_net = (ref.bid / o.limit_px - 1.0 if o.side == "buy"
-                       else o.limit_px / ref.ask - 1.0) - fee_cycle
+                       else o.limit_px / ref.ask - 1.0) - fee_cycle - exit_cost
             if exp_net * 100 < c["cancel_net_pct"] or loc - o.created > c["ttl_s"] * 1000:
                 lst.remove(o)
                 o.status = "cancelled"
@@ -412,8 +426,12 @@ class Forward:
                 self._cancel_maker(tr, loc, "maker_cancel" if exp_net * 100
                                    < c["cancel_net_pct"] else "maker_ttl")
                 continue
-            # 3) репрайс: следуем за своей стороной книги (paper: очередь теряем)
+            # 3) репрайс: следуем за своей стороной книги, но НЕ ДАЛЬШЕ пола
+            # преследования от места постановки. Погоня без пола встречает рынок
+            # в худшей точке отката — на выходе пол уже стоял, на входе не было
             tgt = own.bid if o.side == "buy" else own.ask
+            tgt = self._clamp_dist(o.side, o.decision_px, tgt,
+                                   c.get("chase_max_bps", -1))
             if abs(tgt / o.limit_px - 1) > 2e-4:
                 o.limit_px = tgt
 
@@ -497,25 +515,32 @@ class Forward:
         if abs(target / o.limit_px - 1) > 2e-4:
             o.limit_px = target
 
+    @staticmethod
+    def _clamp_dist(side, decision_px, target, cap_bps):
+        """Ограничитель дистанции преследования: заявка следует за рынком не
+        дальше cap_bps от места постановки. Невыгодная сторона (продажа вниз /
+        покупка вверх) ограничена, выгодная — свободна. cap<0 = выключено."""
+        if cap_bps is None or cap_bps < 0:
+            return target
+        if side == "sell":
+            return max(target, decision_px * (1 - cap_bps / 1e4))
+        return min(target, decision_px * (1 + cap_bps / 1e4))
+
     def _chase_clamp(self, tr: Trade, o: POrder, book, target):
-        """ПОЛ ПРЕСЛЕДОВАНИЯ. Погоня за уходящей ценой без пола гарантированно
-        встречает рынок в худшей точке отката (замерено: -10.3 б.п. на ногу).
-        Лимитка следует за рынком не дальше chase_max_bps от цены постановки
-        и никогда — за уровень безубытка сделки, когда тот был достижим.
-        В выгодную сторону репрайс свободен."""
+        """ПОЛ ПРЕСЛЕДОВАНИЯ НА ВЫХОДЕ. Погоня за уходящей ценой без пола
+        гарантированно встречает рынок в худшей точке отката (замерено:
+        -10.3 б.п. на ногу). Дистанция ограничена chase_max_bps, плюс заявка
+        никогда не уходит за уровень безубытка сделки, когда тот достижим."""
         cap = self.cfg["exit"].get("chase_max_bps", -1)
-        if cap < 0:
+        if cap is None or cap < 0:
             return target                               # пол выключен
+        out = self._clamp_dist(o.side, o.decision_px, target, cap)
         be = self._seq_be_px(tr, o, book)
+        if be is None:
+            return out
         if o.side == "sell":
-            floor = o.decision_px * (1 - cap / 1e4)
-            if be is not None and be <= o.decision_px:  # безубыток достижим
-                floor = max(floor, be)
-            return max(target, floor)
-        ceil_ = o.decision_px * (1 + cap / 1e4)
-        if be is not None and be >= o.decision_px:
-            ceil_ = min(ceil_, be)
-        return min(target, ceil_)
+            return max(out, be) if be <= o.decision_px else out
+        return min(out, be) if be >= o.decision_px else out
 
     def _seq_be_px(self, tr: Trade, o: POrder, book):
         """Цена пассивной ноги, при которой ПОЛНЫЙ PnL сделки = 0, если вторую
@@ -923,12 +948,15 @@ async def main():
     ap.add_argument("--max-symbols", type=int, default=0)
     ap.add_argument("--minutes", type=float, default=0)
     ap.add_argument("--entry-net", type=float, default=None, help="override entry.net_min_pct")
+    ap.add_argument("--maker-net", type=float, default=None, help="override maker.net_min_pct")
     ap.add_argument("--scheme", choices=["auto", "taker", "maker"], default=None)
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(os.path.join(ROOT, "forward.yaml"), encoding="utf-8"))
     if args.entry_net is not None:
         cfg["entry"]["net_min_pct"] = args.entry_net
+    if args.maker_net is not None:                  # смоук: порог мейкера отдельно,
+        cfg["maker"]["net_min_pct"] = args.maker_net   # иначе --entry-net его не покрывает
     if args.scheme is not None:
         cfg["scheme"]["mode"] = args.scheme
     cfg_json = json.dumps(cfg, sort_keys=True)
